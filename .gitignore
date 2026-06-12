@@ -1,0 +1,17 @@
+node_modules/
+
+.env
+.env.*
+!.env.example
+
+chat.db
+chat.db-*
+*.db
+*.db-shm
+*.db-wal
+
+data/*.json
+
+dist/
+coverage/
+*.log
