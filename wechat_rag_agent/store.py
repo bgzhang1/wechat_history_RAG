@@ -29,9 +29,10 @@ def db() -> sqlite3.Connection:
     if _conn is not None:
         return _conn
 
-    _conn = sqlite3.connect(DB_PATH)
+    _conn = sqlite3.connect(DB_PATH, timeout=30)
     _conn.row_factory = sqlite3.Row
     _conn.execute("PRAGMA journal_mode = WAL")
+    _conn.execute("PRAGMA busy_timeout = 30000")
 
     try:
         import sqlite_vec
@@ -71,9 +72,6 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_sender ON messages(sender);
         CREATE INDEX IF NOT EXISTS idx_seq    ON messages(thread, seq);
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
-          USING fts5(content, content=messages, content_rowid=rowid, tokenize='trigram');
-
         CREATE TABLE IF NOT EXISTS sessions (
           session_id   INTEGER PRIMARY KEY,
           thread       TEXT NOT NULL,
@@ -89,11 +87,32 @@ def init_schema(conn: sqlite3.Connection) -> None:
           msg_id     TEXT PRIMARY KEY,
           session_id INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS ingest_files (
+          path       TEXT PRIMARY KEY,
+          size       INTEGER NOT NULL,
+          mtime_ns   INTEGER NOT NULL,
+          total      INTEGER NOT NULL,
+          included   INTEGER NOT NULL,
+          inserted   INTEGER NOT NULL,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
+    create_messages_fts(conn, if_not_exists=True)
     if _vec_available:
         create_vector_table(conn, EMBED_DIM, if_not_exists=True)
     conn.commit()
+
+
+def create_messages_fts(conn: sqlite3.Connection, if_not_exists: bool = True) -> None:
+    clause = "IF NOT EXISTS " if if_not_exists else ""
+    conn.execute(
+        f"""
+        CREATE VIRTUAL TABLE {clause}messages_fts
+          USING fts5(content, content=messages, content_rowid=rowid, tokenize='trigram')
+        """
+    )
 
 
 def create_vector_table(conn: sqlite3.Connection, dimension: int, if_not_exists: bool = True) -> None:
@@ -153,7 +172,33 @@ def insert_messages(messages: list[NormMessage]) -> int:
     return conn.total_changes - before
 
 
-def finalize_ingest() -> None:
+def ingest_file_unchanged(path: str, size: int, mtime_ns: int) -> bool:
+    row = db().execute(
+        "SELECT size, mtime_ns FROM ingest_files WHERE path = ?",
+        (path,),
+    ).fetchone()
+    return bool(row and row["size"] == size and row["mtime_ns"] == mtime_ns)
+
+
+def record_ingest_file(path: str, size: int, mtime_ns: int, total: int, included: int, inserted: int) -> None:
+    db().execute(
+        """
+        INSERT INTO ingest_files (path, size, mtime_ns, total, included, inserted, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(path) DO UPDATE SET
+          size = excluded.size,
+          mtime_ns = excluded.mtime_ns,
+          total = excluded.total,
+          included = excluded.included,
+          inserted = excluded.inserted,
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        (path, size, mtime_ns, total, included, inserted),
+    )
+    db().commit()
+
+
+def recompute_message_sequence() -> None:
     conn = db()
     conn.executescript(
         """
@@ -164,11 +209,54 @@ def finalize_ingest() -> None:
         UPDATE messages
         SET seq = (SELECT rn FROM ranked WHERE ranked.id = messages.id)
         WHERE id IN (SELECT id FROM ranked);
-
-        INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
         """
     )
     conn.commit()
+
+
+def rebuild_fts() -> None:
+    conn = db()
+    with conn:
+        conn.execute("DROP TABLE IF EXISTS messages_fts")
+        create_messages_fts(conn, if_not_exists=False)
+        conn.execute(
+            """
+            INSERT INTO messages_fts(rowid, content)
+            SELECT rowid, content FROM messages
+            """
+        )
+
+
+def sync_missing_fts() -> int:
+    conn = db()
+    missing = conn.execute(
+        """
+        SELECT COUNT(*) c
+        FROM messages m
+        WHERE NOT EXISTS (
+          SELECT 1 FROM messages_fts f WHERE f.rowid = m.rowid
+        )
+        """
+    ).fetchone()["c"]
+    if missing == 0:
+        return 0
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO messages_fts(rowid, content)
+            SELECT m.rowid, m.content
+            FROM messages m
+            WHERE NOT EXISTS (
+              SELECT 1 FROM messages_fts f WHERE f.rowid = m.rowid
+            )
+            """
+        )
+    return int(missing)
+
+
+def finalize_ingest() -> None:
+    recompute_message_sequence()
+    rebuild_fts()
 
 
 def replace_sessions(rows: list[Any]) -> list[int]:
@@ -401,6 +489,11 @@ def get_sessions(ids: list[int]) -> list[dict[str, Any]]:
         return []
     placeholders = ",".join("?" for _ in ids)
     rows = db().execute(f"SELECT * FROM sessions WHERE session_id IN ({placeholders})", ids).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_all_sessions() -> list[dict[str, Any]]:
+    rows = db().execute("SELECT * FROM sessions ORDER BY session_id").fetchall()
     return [dict(row) for row in rows]
 
 
