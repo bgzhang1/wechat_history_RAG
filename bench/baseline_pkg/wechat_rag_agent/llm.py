@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import time
-from functools import lru_cache
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -21,10 +20,11 @@ def embed_configured() -> bool:
     return bool(os.getenv("EMBED_BASE_URL") and os.getenv("EMBED_API_KEY") and os.getenv("EMBED_MODEL"))
 
 
-@lru_cache(maxsize=8)
-def _chat_model_cached(model: str) -> ChatOpenAI:
+def chat_model(model: str | None = None) -> ChatOpenAI:
+    if not chat_configured():
+        raise RuntimeError("未配置主模型：请在 .env 中设置 CHAT_BASE_URL / CHAT_API_KEY / CHAT_MODEL")
     return ChatOpenAI(
-        model=model,
+        model=model or os.environ["CHAT_MODEL"],
         base_url=os.environ["CHAT_BASE_URL"],
         api_key=os.environ["CHAT_API_KEY"],
         temperature=0,
@@ -33,32 +33,19 @@ def _chat_model_cached(model: str) -> ChatOpenAI:
     )
 
 
-def chat_model(model: str | None = None) -> ChatOpenAI:
-    if not chat_configured():
-        raise RuntimeError("未配置主模型：请在 .env 中设置 CHAT_BASE_URL / CHAT_API_KEY / CHAT_MODEL")
-    return _chat_model_cached(model or os.environ["CHAT_MODEL"])
-
-
-@lru_cache(maxsize=2)
-def _embed_model_cached(model: str) -> OpenAIEmbeddings:
-    # check_embedding_ctx_length=False：直接发送原文，避免用 tiktoken（OpenAI 分词器）
-    # 给 bge-m3 等非 OpenAI 模型做本地分词切片，更快也更准确。
-    return OpenAIEmbeddings(
-        model=model,
-        base_url=os.environ["EMBED_BASE_URL"],
-        api_key=os.environ["EMBED_API_KEY"],
-        check_embedding_ctx_length=False,
-    )
-
-
 def embed_model() -> OpenAIEmbeddings:
     if not embed_configured():
         raise RuntimeError("未配置 Embedding：请在 .env 中设置 EMBED_BASE_URL / EMBED_API_KEY / EMBED_MODEL")
-    return _embed_model_cached(os.environ["EMBED_MODEL"])
+    return OpenAIEmbeddings(
+        model=os.environ["EMBED_MODEL"],
+        base_url=os.environ["EMBED_BASE_URL"],
+        api_key=os.environ["EMBED_API_KEY"],
+    )
 
 
-def embed(texts: list[str], batch_size: int = 32) -> list[list[float]]:
+def embed(texts: list[str]) -> list[list[float]]:
     embeddings = embed_model()
+    batch_size = 32
     output: list[list[float]] = []
 
     for start in range(0, len(texts), batch_size):

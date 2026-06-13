@@ -1,0 +1,31 @@
+# 更新日志
+
+## 2026-06-13
+
+### 摄入性能优化
+
+- 优化 `python -m wechat_rag_agent.ingest data` 的增量摄入流程：冷启动全量导入从 485.1s 降至 6.4s（76x），重新导出后的增量导入从 451.4s 降至 9.5s（47x），向已有库追加新聊天从 81.7s 降至 6.7s（12x）。
+- 将 `recompute_message_sequence` 从全量关联子查询改为基于主键联接的 `UPDATE ... FROM`，并限定受影响线程、跳过未变化记录，12.3 万条消息的 seq 重算从约 477s 降至约 1s。
+- 增量导入只重建有新消息的线程；`sessions` 新增 `text_hash`，内容未变化的会话块会复用既有摘要和向量，避免全库重新分块、重新摘要、重新 embedding。
+- 新增自愈逻辑：每次运行自动补齐缺失的 FTS 索引、seq、摘要和向量；中断或部分失败后再次运行即可续传。
+- 摘要和 embedding 改为两阶段流水线并发执行，摘要完成后立即进入 embedding 批队列；embedding 默认并发为 4，摘要写库改为批量提交。
+- 复用 LLM/embedding 客户端，减少连接建立开销；对 bge-m3 关闭 OpenAI `tiktoken` 本地分词，直接发送原文。
+- 修复 external-content FTS5 表的 `sync_missing_fts` 判断错误，避免普通导入后全文索引为空。
+- embedding 单批失败不再中止整个导入，失败项会在后续自愈运行中补齐；摘要失败会按错误类型统计输出。
+
+### 基准与验证
+
+- 新增 `bench/` 基准工具、mock LLM 服务、基线代码快照和数据库一致性校验脚本，用于复现优化前后对比。
+- S2 增量导入的 LLM 调用从 2,789 次摘要 + 88 批 embedding 降至 128 次摘要 + 4 批 embedding。
+- 使用与 `session_id` 无关的内容 SHA 校验，优化前后 `messages`、`sessions`、映射和向量产出等价；增量导入最终状态与从零冷构建一致。
+- 使用真实端点验证 1,500 条消息完整链路：mimo-v2-pro 摘要和 siliconflow bge-m3 embedding 均可正常入库。端点超时后可依靠自愈重跑补齐。
+
+### 使用方式
+
+- 日常重新导入直接运行：
+
+```bash
+python -m wechat_rag_agent.ingest data
+```
+
+- 不再需要默认使用 `--force-rebuild`；已有摘要和向量会自动复用，缺失部分会自动补齐。

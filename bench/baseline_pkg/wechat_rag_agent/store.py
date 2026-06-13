@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import array
-import hashlib
 import json
 import os
 import re
 import sqlite3
 from collections import defaultdict
-from typing import Any, Iterable
+from dataclasses import asdict
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -16,17 +16,6 @@ from .parser import NormMessage
 
 
 load_dotenv()
-
-SQL_BATCH = 900
-
-
-def chunk_text_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _batched(items: list[Any], size: int = SQL_BATCH) -> Iterable[list[Any]]:
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
 
 DB_PATH = os.getenv("CHAT_DB", "chat.db")
 
@@ -44,9 +33,6 @@ def db() -> sqlite3.Connection:
     _conn.row_factory = sqlite3.Row
     _conn.execute("PRAGMA journal_mode = WAL")
     _conn.execute("PRAGMA busy_timeout = 30000")
-    # WAL 模式下 NORMAL 已能保证崩溃一致性，且大幅减少每次 commit 的 fsync 开销
-    _conn.execute("PRAGMA synchronous = NORMAL")
-    _conn.execute("PRAGMA cache_size = -64000")
 
     try:
         import sqlite_vec
@@ -94,16 +80,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
           participants TEXT NOT NULL,
           msg_ids      TEXT NOT NULL,
           text         TEXT NOT NULL,
-          summary      TEXT,
-          text_hash    TEXT
+          summary      TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_sessions_thread ON sessions(thread);
 
         CREATE TABLE IF NOT EXISTS msg_session (
           msg_id     TEXT PRIMARY KEY,
           session_id INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_msg_session_sid ON msg_session(session_id);
 
         CREATE TABLE IF NOT EXISTS ingest_files (
           path       TEXT PRIMARY KEY,
@@ -116,23 +99,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
-    _migrate_sessions_text_hash(conn)
     create_messages_fts(conn, if_not_exists=True)
     if _vec_available:
         create_vector_table(conn, EMBED_DIM, if_not_exists=True)
     conn.commit()
-
-
-def _migrate_sessions_text_hash(conn: sqlite3.Connection) -> None:
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-    if "text_hash" not in columns:
-        conn.execute("ALTER TABLE sessions ADD COLUMN text_hash TEXT")
-    rows = conn.execute("SELECT session_id, text FROM sessions WHERE text_hash IS NULL").fetchall()
-    if rows:
-        conn.executemany(
-            "UPDATE sessions SET text_hash = ? WHERE session_id = ?",
-            [(chunk_text_hash(row["text"]), row["session_id"]) for row in rows],
-        )
 
 
 def create_messages_fts(conn: sqlite3.Connection, if_not_exists: bool = True) -> None:
@@ -190,14 +160,11 @@ def ensure_vector_table_dimension(dimension: int) -> bool:
 def insert_messages(messages: list[NormMessage]) -> int:
     conn = db()
     before = conn.total_changes
-    rows = [
-        (m.id, m.sender, m.is_self, m.timestamp, m.content, m.msg_type, m.thread, m.reply_to)
-        for m in messages
-    ]
+    rows = [asdict(message) for message in messages]
     conn.executemany(
         """
         INSERT OR IGNORE INTO messages (id, sender, is_self, timestamp, content, msg_type, thread, reply_to)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (:id, :sender, :is_self, :timestamp, :content, :msg_type, :thread, :reply_to)
         """,
         rows,
     )
@@ -231,29 +198,18 @@ def record_ingest_file(path: str, size: int, mtime_ns: int, total: int, included
     db().commit()
 
 
-def recompute_message_sequence(threads: list[str] | None = None) -> None:
+def recompute_message_sequence() -> None:
     conn = db()
-    scope = ""
-    params: list[Any] = []
-    if threads is not None:
-        if not threads:
-            return
-        placeholders = ",".join("?" for _ in threads)
-        scope = f"WHERE thread IN ({placeholders})"
-        params = list(threads)
-    # UPDATE...FROM 走 messages 主键索引联接，复杂度 O(n log n)；
-    # seq IS NOT rn 跳过已正确的行，追加场景几乎只写新消息。
-    conn.execute(
-        f"""
-        UPDATE messages
-        SET seq = ranked.rn
-        FROM (
+    conn.executescript(
+        """
+        WITH ranked AS (
           SELECT id, ROW_NUMBER() OVER (PARTITION BY thread ORDER BY timestamp, id) AS rn
-          FROM messages {scope}
-        ) AS ranked
-        WHERE messages.id = ranked.id AND messages.seq IS NOT ranked.rn
-        """,
-        params,
+          FROM messages
+        )
+        UPDATE messages
+        SET seq = (SELECT rn FROM ranked WHERE ranked.id = messages.id)
+        WHERE id IN (SELECT id FROM ranked);
+        """
     )
     conn.commit()
 
@@ -271,30 +227,17 @@ def rebuild_fts() -> None:
         )
 
 
-def count_missing_fts() -> int:
-    return int(
-        db().execute(
-            """
-            SELECT COUNT(*) c
-            FROM messages m
-            WHERE NOT EXISTS (
-              SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.rowid
-            )
-            """
-        ).fetchone()["c"]
-    )
-
-
-def count_messages_missing_seq() -> int:
-    return int(db().execute("SELECT COUNT(*) c FROM messages WHERE seq IS NULL").fetchone()["c"])
-
-
 def sync_missing_fts() -> int:
     conn = db()
-    # 注意：不能对 messages_fts 按 rowid 做 EXISTS 判断——external content FTS5
-    # 的 rowid 查询会回源到 messages 表，永远命中，导致增量行从未真正入索引。
-    # 查 _docsize 影子表（每个已索引文档一行）才能得知索引的真实内容。
-    missing = count_missing_fts()
+    missing = conn.execute(
+        """
+        SELECT COUNT(*) c
+        FROM messages m
+        WHERE NOT EXISTS (
+          SELECT 1 FROM messages_fts f WHERE f.rowid = m.rowid
+        )
+        """
+    ).fetchone()["c"]
     if missing == 0:
         return 0
     with conn:
@@ -304,7 +247,7 @@ def sync_missing_fts() -> int:
             SELECT m.rowid, m.content
             FROM messages m
             WHERE NOT EXISTS (
-              SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.rowid
+              SELECT 1 FROM messages_fts f WHERE f.rowid = m.rowid
             )
             """
         )
@@ -316,70 +259,21 @@ def finalize_ingest() -> None:
     rebuild_fts()
 
 
-def get_carryover_for_threads(threads: list[str] | None = None) -> dict[str, tuple[str | None, bytes | None]]:
-    """读取即将被重建的会话块的 (text_hash -> (summary, embedding 字节))，用于内容未变块的复用。"""
-    conn = db()
-    if threads is None:
-        rows = conn.execute("SELECT session_id, text_hash, summary FROM sessions").fetchall()
-    else:
-        if not threads:
-            return {}
-        placeholders = ",".join("?" for _ in threads)
-        rows = conn.execute(
-            f"SELECT session_id, text_hash, summary FROM sessions WHERE thread IN ({placeholders})",
-            list(threads),
-        ).fetchall()
-
-    vectors: dict[int, bytes] = {}
-    if _vec_available and rows:
-        ids = [int(row["session_id"]) for row in rows]
-        for batch in _batched(ids):
-            placeholders = ",".join("?" for _ in batch)
-            for vec_row in conn.execute(
-                f"SELECT session_id, embedding FROM {VECTOR_TABLE} WHERE session_id IN ({placeholders})",
-                batch,
-            ):
-                vectors[int(vec_row["session_id"])] = bytes(vec_row["embedding"])
-
-    carry: dict[str, tuple[str | None, bytes | None]] = {}
-    for row in rows:
-        if row["text_hash"]:
-            carry[row["text_hash"]] = (row["summary"], vectors.get(int(row["session_id"])))
-    return carry
-
-
-def replace_sessions(rows: list[Any], threads: list[str] | None = None) -> list[int]:
-    """重建会话分块。threads=None 时全量重建；否则只替换指定线程的分块。"""
+def replace_sessions(rows: list[Any]) -> list[int]:
     conn = db()
     ids: list[int] = []
     with conn:
-        if threads is None:
-            conn.execute("DELETE FROM sessions")
-            conn.execute("DELETE FROM msg_session")
-            if _vec_available:
-                conn.execute(f"DELETE FROM {VECTOR_TABLE}")
-        elif threads:
-            placeholders = ",".join("?" for _ in threads)
-            old_ids = [
-                int(row["session_id"])
-                for row in conn.execute(
-                    f"SELECT session_id FROM sessions WHERE thread IN ({placeholders})", list(threads)
-                )
-            ]
-            for batch in _batched(old_ids):
-                id_marks = ",".join("?" for _ in batch)
-                conn.execute(f"DELETE FROM msg_session WHERE session_id IN ({id_marks})", batch)
-                if _vec_available:
-                    conn.execute(f"DELETE FROM {VECTOR_TABLE} WHERE session_id IN ({id_marks})", batch)
-            conn.execute(f"DELETE FROM sessions WHERE thread IN ({placeholders})", list(threads))
+        conn.execute("DELETE FROM sessions")
+        conn.execute("DELETE FROM msg_session")
+        if _vec_available:
+            conn.execute(f"DELETE FROM {VECTOR_TABLE}")
 
         for row in rows:
             data = row.__dict__ if hasattr(row, "__dict__") else dict(row)
-            data = {**data, "text_hash": data.get("text_hash") or chunk_text_hash(data["text"])}
             cur = conn.execute(
                 """
-                INSERT INTO sessions (thread, start_time, end_time, participants, msg_ids, text, summary, text_hash)
-                VALUES (:thread, :start_time, :end_time, :participants, :msg_ids, :text, :summary, :text_hash)
+                INSERT INTO sessions (thread, start_time, end_time, participants, msg_ids, text, summary)
+                VALUES (:thread, :start_time, :end_time, :participants, :msg_ids, :text, :summary)
                 """,
                 data,
             )
@@ -393,18 +287,9 @@ def replace_sessions(rows: list[Any], threads: list[str] | None = None) -> list[
 
 
 def insert_embeddings(items: list[dict[str, Any]]) -> None:
-    if not items:
-        return
     if not has_vec():
         raise RuntimeError("sqlite-vec 不可用")
-
-    def to_bytes(embedding: Any) -> bytes:
-        if isinstance(embedding, (bytes, memoryview)):
-            return bytes(embedding)
-        return array.array("f", embedding).tobytes()
-
-    payload = [(int(item["session_id"]), to_bytes(item["embedding"])) for item in items]
-    dimensions = {len(blob) // 4 for _, blob in payload}
+    dimensions = {len(item["embedding"]) for item in items}
     if len(dimensions) > 1:
         raise RuntimeError(f"同一批 embedding 维度不一致：{sorted(dimensions)}")
     dimension = next(iter(dimensions), None)
@@ -418,35 +303,16 @@ def insert_embeddings(items: list[dict[str, Any]]) -> None:
     with conn:
         conn.executemany(
             f"INSERT OR REPLACE INTO {VECTOR_TABLE} (session_id, embedding) VALUES (?, ?)",
-            payload,
+            [
+                (int(item["session_id"]), array.array("f", item["embedding"]).tobytes())
+                for item in items
+            ],
         )
 
 
 def set_summary(session_id: int, summary: str) -> None:
     db().execute("UPDATE sessions SET summary = ? WHERE session_id = ?", (summary, session_id))
     db().commit()
-
-
-def set_summaries(items: list[tuple[int, str]]) -> None:
-    if not items:
-        return
-    conn = db()
-    conn.executemany(
-        "UPDATE sessions SET summary = ? WHERE session_id = ?",
-        [(summary, session_id) for session_id, summary in items],
-    )
-    conn.commit()
-
-
-def count_sessions_missing_summary() -> int:
-    return int(db().execute("SELECT COUNT(*) c FROM sessions WHERE summary IS NULL").fetchone()["c"])
-
-
-def get_session_ids_with_embedding() -> set[int]:
-    if not has_vec():
-        return set()
-    rows = db().execute(f"SELECT session_id FROM {VECTOR_TABLE}").fetchall()
-    return {int(row["session_id"]) for row in rows}
 
 
 def _norm_time(value: str, is_before: bool) -> str:
@@ -610,17 +476,8 @@ def stats() -> dict[str, Any]:
     }
 
 
-def get_all_messages_by_thread(threads: list[str] | None = None) -> dict[str, list[dict[str, Any]]]:
-    if threads is None:
-        rows = db().execute("SELECT * FROM messages ORDER BY thread, seq").fetchall()
-    else:
-        if not threads:
-            return {}
-        placeholders = ",".join("?" for _ in threads)
-        rows = db().execute(
-            f"SELECT * FROM messages WHERE thread IN ({placeholders}) ORDER BY thread, seq",
-            list(threads),
-        ).fetchall()
+def get_all_messages_by_thread() -> dict[str, list[dict[str, Any]]]:
+    rows = db().execute("SELECT * FROM messages ORDER BY thread, seq").fetchall()
     result: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         result[row["thread"]].append(dict(row))

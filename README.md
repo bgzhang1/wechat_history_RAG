@@ -2,6 +2,8 @@
 
 把 WeFlow 导出的微信聊天 JSON 导入 SQLite，然后用自然语言检索、追溯上下文、统计聊天内容。
 
+性能优化与基准结果见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 快速开始
 
 ```bash
@@ -17,7 +19,7 @@ python -m wechat_rag_agent.ingest data
 python -m wechat_rag_agent.cli
 ```
 
-没有配置 `EMBED_*` 也可以运行，`semantic_search` 会自动退化为 FTS-only。配置好 embedding 后用 `--force-rebuild` 重新运行 ingest 即可补建向量索引。
+没有配置 `EMBED_*` 也可以运行，`semantic_search` 会自动退化为 FTS-only。配置好 embedding 后重新运行 ingest 即可自动补建向量索引（无需 --force）。
 
 ## 常用命令
 
@@ -29,16 +31,18 @@ python -m wechat_rag_agent.scripts.check
 python -m wechat_rag_agent.ingest data
 python -m wechat_rag_agent.ingest path\to\chat.json --no-summary
 
-# 文件大小和修改时间没变时会直接跳过解析；本次新增消息为 0 时会自动跳过 FTS/分块/摘要/向量重建。
+# 文件大小和修改时间没变时会直接跳过解析；增量导入只重建有新消息的会话线程，
+# 内容未变的会话块自动复用已有摘要和向量（不重复调用 LLM）。
+# 上次中断/失败留下的缺失摘要、向量、FTS 索引会在下次运行时自动补齐。
 # 可以分别强制某个阶段，也可以用 --force-rebuild 全量重建。
 python -m wechat_rag_agent.ingest data --force-fts
 python -m wechat_rag_agent.ingest data --force-chunks
-python -m wechat_rag_agent.ingest data --force-summary --summary-workers 4
-python -m wechat_rag_agent.ingest data --force-embeddings --embed-workers 2 --embed-batch-size 32
+python -m wechat_rag_agent.ingest data --force-summary
+python -m wechat_rag_agent.ingest data --force-embeddings
 python -m wechat_rag_agent.ingest data --force-rebuild
 
-# 手动设置摘要和 embedding 并发数
-python -m wechat_rag_agent.ingest data --summary-workers 4 --embed-workers 2 --embed-batch-size 32
+# 摘要和 embedding 并发数（默认分别为 20 和 4）
+python -m wechat_rag_agent.ingest data --summary-workers 20 --embed-workers 4 --embed-batch-size 32
 
 # 不依赖模型的检索层冒烟测试
 python -m wechat_rag_agent.scripts.smoke
@@ -70,9 +74,11 @@ wechat_rag_agent/
 - LangChain 负责模型连接、消息结构和工具调用。
 - SQLite 仍然负责本地数据、FTS5 trigram、上下文窗口和统计查询。
 - `ingest` 会缓存已处理文件的路径、大小和修改时间；文件未变化时直接跳过解析。
-- `ingest` 会统计本次真实新增消息数；新增为 0 时默认不做重建，避免大 JSON 重复导入时白等。
+- 增量导入只重建有新消息的线程；会话块带内容哈希（text_hash），内容未变的块直接复用已有摘要和向量，不重复调用 LLM。重新导出同一个聊天再导入时，通常只有末尾少数新块需要处理。
+- 缺失的 FTS 索引、seq、摘要、向量会在每次运行时自动检测并补齐（自愈），中断后重跑即可续传。
+- 摘要按完成顺序流式进入 embedding 批队列，两个阶段并行执行；摘要写库批量提交。
 - FTS、会话分块、摘要、向量索引可以分别用 `--force-fts`、`--force-chunks`、`--force-summary`、`--force-embeddings` 重建。
-- 摘要和 embedding 支持手动并发，分别用 `--summary-workers` 和 `--embed-workers` 控制。
+- 摘要和 embedding 并发分别用 `--summary-workers`（默认 20）和 `--embed-workers`（默认 4）控制。
 - `semantic_search` 使用 FTS + sqlite-vec 向量召回，再用 RRF 融合；向量不可用时自动降级。
 - 对 `hi`、`你好` 这类纯问候，本地直接回复，避免触发某些网关的反测活拦截。
 
