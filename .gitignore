@@ -1,4 +1,25 @@
-node_modules/
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Local-only data, databases, benchmark snapshots, and legacy artifacts
+local/
+runtime/
+bench/
+data/
+chat.db
+chat.db-*
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.log
+
+# Python caches and virtual environments
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -7,18 +28,10 @@ __pycache__/
 .venv/
 venv/
 
-.env
-.env.*
-!.env.example
-
-chat.db
-chat.db-*
-*.db
-*.db-shm
-*.db-wal
-
-data/*.json
-
+# Node/TypeScript leftovers are not part of the Python agent source.
+node_modules/
+package.json
+package-lock.json
+tsconfig.json
 dist/
 coverage/
-*.log

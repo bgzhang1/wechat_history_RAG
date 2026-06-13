@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Iterable
 
 from dotenv import load_dotenv
@@ -28,11 +29,20 @@ def _batched(items: list[Any], size: int = SQL_BATCH) -> Iterable[list[Any]]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
 
-DB_PATH = os.getenv("CHAT_DB", "chat.db")
+DB_PATH = os.getenv("CHAT_DB", str(Path("runtime") / "chat.db"))
 
 _conn: sqlite3.Connection | None = None
 _vec_available = False
 VECTOR_TABLE = "sessions_vec"
+
+
+def _sqlite_path(path: str) -> str:
+    if path == ":memory:" or path.startswith("file:"):
+        return path
+    db_path = Path(path).expanduser()
+    if db_path.parent != Path("."):
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    return str(db_path)
 
 
 def db() -> sqlite3.Connection:
@@ -40,7 +50,7 @@ def db() -> sqlite3.Connection:
     if _conn is not None:
         return _conn
 
-    _conn = sqlite3.connect(DB_PATH, timeout=30)
+    _conn = sqlite3.connect(_sqlite_path(DB_PATH), timeout=30)
     _conn.row_factory = sqlite3.Row
     _conn.execute("PRAGMA journal_mode = WAL")
     _conn.execute("PRAGMA busy_timeout = 30000")

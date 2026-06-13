@@ -16,8 +16,9 @@ def main() -> None:
     if not chat_configured():
         raise SystemExit("未配置主模型。请复制 .env.example 为 .env 并填入 CHAT_BASE_URL / CHAT_API_KEY / CHAT_MODEL。")
 
-    if not Path(store.DB_PATH).exists():
-        raise SystemExit("找不到 chat.db。请先运行: python -m wechat_rag_agent.ingest <微信导出JSON文件或目录>")
+    db_path = Path(store.DB_PATH)
+    if not db_path.exists():
+        raise SystemExit(f"找不到数据库 {db_path}。请先运行: python -m wechat_rag_agent.ingest local/data")
 
     store.db()
     stats = store.stats()
