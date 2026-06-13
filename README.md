@@ -41,8 +41,14 @@ python -m wechat_rag_agent.ingest data --force-summary
 python -m wechat_rag_agent.ingest data --force-embeddings
 python -m wechat_rag_agent.ingest data --force-rebuild
 
-# 摘要和 embedding 并发数（默认分别为 20 和 4）
-python -m wechat_rag_agent.ingest data --summary-workers 20 --embed-workers 4 --embed-batch-size 32
+# 摘要批量请求和 embedding 并发数；接口慢/限流时可调小 workers、调大 summary batch
+python -m wechat_rag_agent.ingest data --summary-workers 1 --summary-batch-size 4 --embed-workers 2 --embed-batch-size 16
+
+# 进度显示与摘要兜底：摘要 422/BadRequest 时会自动用更短文本重试
+python -m wechat_rag_agent.ingest data --progress-every 20 --progress-interval 10 --summary-batch-size 4 --summary-max-chars 3000 --summary-fallback-chars 1200
+
+# 默认遇到摘要/embedding 模型或 API 错误会立即停止；需要尽量跑完时再显式开启
+python -m wechat_rag_agent.ingest data --keep-going
 
 # 不依赖模型的检索层冒烟测试
 python -m wechat_rag_agent.scripts.smoke
@@ -78,7 +84,11 @@ wechat_rag_agent/
 - 缺失的 FTS 索引、seq、摘要、向量会在每次运行时自动检测并补齐（自愈），中断后重跑即可续传。
 - 摘要按完成顺序流式进入 embedding 批队列，两个阶段并行执行；摘要写库批量提交。
 - FTS、会话分块、摘要、向量索引可以分别用 `--force-fts`、`--force-chunks`、`--force-summary`、`--force-embeddings` 重建。
-- 摘要和 embedding 并发分别用 `--summary-workers`（默认 20）和 `--embed-workers`（默认 4）控制。
+- 摘要请求会按 `--summary-batch-size`（默认 4）一次处理多个会话块，减少 API 请求数；摘要和 embedding 并发分别用 `--summary-workers`（默认 2）和 `--embed-workers`（默认 4）控制。
+- 进度输出可用 `--progress-every` / `--progress-interval` 调整。
+- 摘要遇到 `UnprocessableEntityError` / `BadRequestError` 时，会按 `--summary-fallback-chars` 使用更短文本重试；仍失败时默认立即停止。
+- 默认遇到摘要或 embedding 的模型/API 错误会立即停止并返回非 0 状态，避免问题扩大；需要旧的“尽量跑完再汇总失败”行为时加 `--keep-going`。
+- 模型超时和重试可在 `.env` 中配置：`CHAT_TIMEOUT`、`CHAT_MAX_RETRIES`、`EMBED_TIMEOUT`、`EMBED_MAX_RETRIES`、`EMBED_LOCAL_RETRIES`、`EMBED_RETRY_SLEEP`。
 - `semantic_search` 使用 FTS + sqlite-vec 向量召回，再用 RRF 融合；向量不可用时自动降级。
 - 对 `hi`、`你好` 这类纯问候，本地直接回复，避免触发某些网关的反测活拦截。
 

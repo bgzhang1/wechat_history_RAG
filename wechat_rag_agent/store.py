@@ -414,10 +414,18 @@ def insert_embeddings(items: list[dict[str, Any]]) -> None:
             f"embedding 维度不匹配：sessions_vec 期望 {expected} 维，但本批是 {dimension} 维。"
             "请重跑 ingest，程序会自动重建向量表。"
         )
+    deduped: dict[int, bytes] = {}
+    for session_id, blob in payload:
+        deduped[session_id] = blob
+    payload = list(deduped.items())
     conn = db()
     with conn:
+        ids = [session_id for session_id, _ in payload]
+        for batch in _batched(ids):
+            placeholders = ",".join("?" for _ in batch)
+            conn.execute(f"DELETE FROM {VECTOR_TABLE} WHERE session_id IN ({placeholders})", batch)
         conn.executemany(
-            f"INSERT OR REPLACE INTO {VECTOR_TABLE} (session_id, embedding) VALUES (?, ?)",
+            f"INSERT INTO {VECTOR_TABLE} (session_id, embedding) VALUES (?, ?)",
             payload,
         )
 

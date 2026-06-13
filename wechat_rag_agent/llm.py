@@ -13,6 +13,28 @@ load_dotenv()
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
 
 
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
 def chat_configured() -> bool:
     return bool(os.getenv("CHAT_BASE_URL") and os.getenv("CHAT_API_KEY") and os.getenv("CHAT_MODEL"))
 
@@ -28,8 +50,8 @@ def _chat_model_cached(model: str) -> ChatOpenAI:
         base_url=os.environ["CHAT_BASE_URL"],
         api_key=os.environ["CHAT_API_KEY"],
         temperature=0,
-        timeout=90,
-        max_retries=1,
+        timeout=_env_float("CHAT_TIMEOUT", 90.0, minimum=1.0),
+        max_retries=_env_int("CHAT_MAX_RETRIES", 0, minimum=0),
     )
 
 
@@ -48,6 +70,8 @@ def _embed_model_cached(model: str) -> OpenAIEmbeddings:
         base_url=os.environ["EMBED_BASE_URL"],
         api_key=os.environ["EMBED_API_KEY"],
         check_embedding_ctx_length=False,
+        timeout=_env_float("EMBED_TIMEOUT", 90.0, minimum=1.0),
+        max_retries=_env_int("EMBED_MAX_RETRIES", 0, minimum=0),
     )
 
 
@@ -60,18 +84,21 @@ def embed_model() -> OpenAIEmbeddings:
 def embed(texts: list[str], batch_size: int = 32) -> list[list[float]]:
     embeddings = embed_model()
     output: list[list[float]] = []
+    local_retries = _env_int("EMBED_LOCAL_RETRIES", 1, minimum=1)
+    retry_sleep = _env_float("EMBED_RETRY_SLEEP", 1.0, minimum=0.0)
 
     for start in range(0, len(texts), batch_size):
         batch = texts[start : start + batch_size]
         last_error: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(local_retries):
             try:
                 output.extend(embeddings.embed_documents(batch))
                 last_error = None
                 break
             except Exception as exc:
                 last_error = exc
-                time.sleep(attempt + 1)
+                if attempt + 1 < local_retries and retry_sleep:
+                    time.sleep(retry_sleep * (attempt + 1))
         if last_error:
             raise last_error
 

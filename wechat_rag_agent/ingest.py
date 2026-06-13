@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -17,14 +17,60 @@ from .parser import is_weflow_export, parse_weflow
 
 load_dotenv()
 
-SUMMARY_PROMPT = "用一句话（30字内）概括这段聊天讨论的主题和关键事项，直接输出概括，不要任何前缀。聊天内容：\n\n"
+SUMMARY_PROMPT = "用一句话概括这段聊天讨论的主题和关键事项，直接输出概括，不要任何前缀。聊天内容：\n\n"
 SUMMARY_FLUSH_EVERY = 200
+DEFAULT_PROGRESS_EVERY = 50
+DEFAULT_PROGRESS_INTERVAL = 15.0
+DEFAULT_SUMMARY_BATCH_SIZE = 4
+DEFAULT_SUMMARY_MAX_CHARS = 3000
+DEFAULT_SUMMARY_FALLBACK_CHARS = 1200
+SUMMARY_BATCH_PROMPT = """请分别概括下面多个聊天块的主题和关键事项。
+只输出 JSON 数组，不要 Markdown，不要解释。
+数组长度应等于输入块数，每项格式为 {"id": 数字, "summary": "一句话摘要"}。
+不要合并不同 id 的内容。聊天块 JSON：
+"""
+SUMMARY_RETRY_SHORT_ERRORS = {"UnprocessableEntityError", "BadRequestError"}
+SUMMARY_SPLIT_BATCH_ERRORS = {"UnprocessableEntityError", "BadRequestError", "SummaryBatchParseError"}
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def positive_int(raw: str) -> int:
     value = int(raw)
     if value < 1:
         raise argparse.ArgumentTypeError("必须是 >= 1 的整数")
+    return value
+
+
+def non_negative_int(raw: str) -> int:
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("必须是 >= 0 的整数")
+    return value
+
+
+def positive_float(raw: str) -> float:
+    value = float(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("必须是 > 0 的数字")
     return value
 
 
@@ -50,19 +96,248 @@ def parse_args() -> argparse.Namespace:
         dest="force_embeddings",
         help="强制重建向量索引",
     )
-    parser.add_argument("--summary-workers", type=positive_int, default=20, help="摘要生成并发数，默认 20")
+    parser.add_argument("--summary-workers", type=positive_int, default=2, help="摘要生成并发数，默认 2")
+    parser.add_argument(
+        "--summary-batch-size",
+        type=positive_int,
+        default=max(1, env_int("SUMMARY_BATCH_SIZE", DEFAULT_SUMMARY_BATCH_SIZE)),
+        help="每个摘要请求包含的会话块数量，默认 4；也可用 SUMMARY_BATCH_SIZE 配置",
+    )
     parser.add_argument("--embed-workers", type=positive_int, default=4, help="embedding 批次并发数，默认 4")
     parser.add_argument("--embed-batch-size", type=positive_int, default=32, help="每个 embedding 请求批次的会话块数量，默认 32")
+    parser.add_argument(
+        "--summary-max-chars",
+        type=positive_int,
+        default=max(1, env_int("SUMMARY_MAX_CHARS", DEFAULT_SUMMARY_MAX_CHARS)),
+        help="每块摘要最多发送的字符数，默认 3000；也可用 SUMMARY_MAX_CHARS 配置",
+    )
+    parser.add_argument(
+        "--summary-fallback-chars",
+        type=non_negative_int,
+        default=max(0, env_int("SUMMARY_FALLBACK_CHARS", DEFAULT_SUMMARY_FALLBACK_CHARS)),
+        help="摘要遇到 422/BadRequest 时改用更短文本重试；0 表示禁用，默认 1200",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=positive_int,
+        default=max(1, env_int("PROGRESS_EVERY", DEFAULT_PROGRESS_EVERY)),
+        help="每处理多少个块输出一次进度，默认 50；也可用 PROGRESS_EVERY 配置",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=positive_float,
+        default=max(0.1, env_float("PROGRESS_INTERVAL", DEFAULT_PROGRESS_INTERVAL)),
+        help="embedding 无完成批次时的等待提示间隔秒数，默认 15；也可用 PROGRESS_INTERVAL 配置",
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="摘要或 embedding 单批失败时继续处理其余批次；默认遇到模型/API错误立即停止",
+    )
     return parser.parse_args()
 
 
-def summarize_chunk(model_name: str, chunk: Chunk) -> tuple[str | None, str | None]:
+def compact_error(exc: Exception, limit: int = 300) -> str:
+    detail = str(exc).strip().replace("\r", " ").replace("\n", " ")
+    if not detail:
+        return type(exc).__name__
+    return detail[:limit]
+
+
+def format_error_counts(errors: dict[str, int]) -> str:
+    return "，".join(f"{name}×{count}" for name, count in sorted(errors.items()))
+
+
+class SummaryBatchParseError(ValueError):
+    pass
+
+
+def merge_counts(target: dict[str, int], source: dict[str, int]) -> None:
+    for name, count in source.items():
+        target[name] = target.get(name, 0) + count
+
+
+def merge_examples(target: dict[str, str], source: dict[str, str]) -> None:
+    for name, example in source.items():
+        target.setdefault(name, example)
+
+
+def extract_json(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].lstrip().startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+
+    array_start = stripped.find("[")
+    array_end = stripped.rfind("]")
+    if array_start >= 0 and array_end > array_start:
+        return stripped[array_start : array_end + 1]
+
+    object_start = stripped.find("{")
+    object_end = stripped.rfind("}")
+    if object_start >= 0 and object_end > object_start:
+        return stripped[object_start : object_end + 1]
+
+    raise SummaryBatchParseError("摘要批量响应中没有可解析的 JSON")
+
+
+def parse_summary_batch_response(raw: str, expected_ids: list[int]) -> dict[int, str]:
     try:
-        res = chat_model(model_name).invoke(SUMMARY_PROMPT + chunk.text[:3000])
-        summary = str(res.content).strip()
-        return (summary or None), None
+        data = json.loads(extract_json(raw))
     except Exception as exc:
-        return None, type(exc).__name__
+        raise SummaryBatchParseError(f"摘要批量响应不是合法 JSON：{compact_error(exc)}") from exc
+
+    result: dict[int, str] = {}
+    if isinstance(data, dict):
+        if isinstance(data.get("summaries"), list):
+            data = data["summaries"]
+        else:
+            for expected_id in expected_ids:
+                value = data.get(str(expected_id), data.get(expected_id))
+                if isinstance(value, str) and value.strip():
+                    result[expected_id] = value.strip()
+            if result:
+                return result
+            raise SummaryBatchParseError("摘要批量响应 JSON 缺少 summaries 或 id 映射")
+
+    if not isinstance(data, list):
+        raise SummaryBatchParseError("摘要批量响应 JSON 顶层不是数组")
+
+    if all(isinstance(item, str) for item in data):
+        if len(data) != len(expected_ids):
+            raise SummaryBatchParseError(f"摘要数组长度不匹配：期望 {len(expected_ids)}，实际 {len(data)}")
+        return {
+            expected_id: str(summary).strip()
+            for expected_id, summary in zip(expected_ids, data)
+            if str(summary).strip()
+        }
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("id", item.get("index", item.get("chunk_id")))
+        summary = item.get("summary", item.get("摘要"))
+        try:
+            summary_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(summary, str) and summary.strip():
+            result[summary_id] = summary.strip()
+
+    if not result:
+        raise SummaryBatchParseError("摘要批量响应没有解析到任何 summary")
+    return result
+
+
+def summarize_once(model_name: str, text: str) -> str | None:
+    res = chat_model(model_name).invoke(SUMMARY_PROMPT + text)
+    summary = str(res.content).strip()
+    return summary or None
+
+
+def summarize_batch_once(
+    model_name: str,
+    items: list[tuple[int, Chunk]],
+    max_chars: int,
+) -> dict[int, str]:
+    payload = [
+        {"id": local_id, "text": chunk.text[:max_chars]}
+        for local_id, (_, chunk) in enumerate(items, start=1)
+    ]
+    res = chat_model(model_name).invoke(SUMMARY_BATCH_PROMPT + json.dumps(payload, ensure_ascii=False))
+    expected_ids = list(range(1, len(items) + 1))
+    return parse_summary_batch_response(str(res.content), expected_ids)
+
+
+def summarize_chunk(
+    model_name: str,
+    chunk: Chunk,
+    max_chars: int,
+    fallback_chars: int,
+) -> tuple[str | None, str | None, str | None]:
+    try:
+        return summarize_once(model_name, chunk.text[:max_chars]), None, None
+    except Exception as exc:
+        error_name = type(exc).__name__
+        can_retry_short = (
+            error_name in SUMMARY_RETRY_SHORT_ERRORS
+            and fallback_chars > 0
+            and fallback_chars < max_chars
+        )
+        if can_retry_short:
+            try:
+                return summarize_once(model_name, chunk.text[:fallback_chars]), None, None
+            except Exception as retry_exc:
+                return None, type(retry_exc).__name__, compact_error(retry_exc)
+        return None, error_name, compact_error(exc)
+
+
+def summarize_batch(
+    model_name: str,
+    items: list[tuple[int, Chunk]],
+    max_chars: int,
+    fallback_chars: int,
+) -> tuple[dict[int, str], dict[str, int], dict[str, str]]:
+    if not items:
+        return {}, {}, {}
+    if len(items) == 1:
+        index, chunk = items[0]
+        summary, error, detail = summarize_chunk(model_name, chunk, max_chars, fallback_chars)
+        if summary:
+            return {index: summary}, {}, {}
+        return {}, ({error: 1} if error else {}), ({error: detail} if error and detail else {})
+
+    try:
+        local_summaries = summarize_batch_once(model_name, items, max_chars)
+    except Exception as exc:
+        last_exc = exc
+        error_name = type(exc).__name__
+        if error_name in SUMMARY_RETRY_SHORT_ERRORS and 0 < fallback_chars < max_chars:
+            try:
+                local_summaries = summarize_batch_once(model_name, items, fallback_chars)
+                last_exc = None
+            except Exception as retry_exc:
+                last_exc = retry_exc
+
+        if last_exc is not None:
+            last_name = type(last_exc).__name__
+            if last_name in SUMMARY_SPLIT_BATCH_ERRORS:
+                midpoint = len(items) // 2
+                left_summaries, left_errors, left_examples = summarize_batch(
+                    model_name, items[:midpoint], max_chars, fallback_chars
+                )
+                right_summaries, right_errors, right_examples = summarize_batch(
+                    model_name, items[midpoint:], max_chars, fallback_chars
+                )
+                merge_counts(left_errors, right_errors)
+                merge_examples(left_examples, right_examples)
+                return {**left_summaries, **right_summaries}, left_errors, left_examples
+            return {}, {last_name: len(items)}, {last_name: compact_error(last_exc)}
+
+    summaries: dict[int, str] = {}
+    missing: list[tuple[int, Chunk]] = []
+    for local_id, item in enumerate(items, start=1):
+        original_index, _ = item
+        summary = local_summaries.get(local_id)
+        if summary:
+            summaries[original_index] = summary
+        else:
+            missing.append(item)
+
+    errors: dict[str, int] = {}
+    examples: dict[str, str] = {}
+    if missing:
+        missing_summaries, missing_errors, missing_examples = summarize_batch(
+            model_name, missing, max_chars, fallback_chars
+        )
+        summaries.update(missing_summaries)
+        merge_counts(errors, missing_errors)
+        merge_examples(examples, missing_examples)
+    return summaries, errors, examples
 
 
 def record_pending_files(records: list[tuple[str, int, int, int, int, int]]) -> None:
@@ -299,102 +574,236 @@ def main() -> None:
         return
 
     batch_size = args.embed_batch_size
-    embed_futures: dict[Future, list[int]] = {}
-    pending_embed: list[int] = []
     summary_buffer: list[tuple[int, str]] = []
     embed_fail_sessions = 0
+    embedded = 0
+    summary_batches = [
+        to_summarize[start : start + args.summary_batch_size]
+        for start in range(0, len(to_summarize), args.summary_batch_size)
+    ]
+    total_embed_batches = (len(to_embed_set) + batch_size - 1) // batch_size if to_embed_set else 0
+    submitted_embed_batches = 0
+    submitted_embed_sessions = 0
+    completed_embed_batches = 0
+    reported_submitted_sessions = 0
+    reported_finished_sessions = 0
 
     if to_summarize:
-        print(f"生成摘要前缀（{summary_model}，{len(to_summarize)} 块，并发 {args.summary_workers}）...")
+        retry_note = (
+            f"，422/BadRequest 短文本重试 {args.summary_fallback_chars} 字"
+            if args.summary_fallback_chars
+            else ""
+        )
+        print(
+            f"生成摘要前缀（{summary_model}，{len(to_summarize)} 块，预计 {len(summary_batches)} 批，"
+            f"批 {args.summary_batch_size}，并发 {args.summary_workers}，最多 {args.summary_max_chars} 字{retry_note}）..."
+        )
     if to_embed_set:
-        print(f"生成 embedding（{os.getenv('EMBED_MODEL')}，{len(to_embed_set)} 块，批 {batch_size}，并发 {args.embed_workers}）...")
+        print(
+            f"生成 embedding（{os.getenv('EMBED_MODEL')}，{len(to_embed_set)} 块，"
+            f"预计 {total_embed_batches} 批，批 {batch_size}，并发 {args.embed_workers}）..."
+        )
 
-    with ThreadPoolExecutor(max_workers=args.summary_workers) as summary_pool, \
-            ThreadPoolExecutor(max_workers=args.embed_workers) as embed_pool:
+    def abort_model_error(stage: str, errors: dict[str, int], examples: dict[str, str]) -> None:
+        store.set_summaries(summary_buffer)
+        summary_buffer.clear()
+        print(f"\n[错误] {stage} 失败，已停止 ingest（{format_error_counts(errors)}）。")
+        for name, example in list(sorted(examples.items()))[:3]:
+            print(f"  {name}: {example}")
+        print("修复模型/API 配置后重跑 ingest，会自动续补缺失部分。")
+        raise SystemExit(1)
 
-        def submit_embed_batch(indices: list[int]) -> None:
-            inputs: list[str] = []
-            for i in indices:
-                summary = summaries.get(session_ids[i])
-                inputs.append(f"{summary}\n{chunks[i].text}" if summary else chunks[i].text)
-            embed_futures[embed_pool.submit(embed, inputs)] = list(indices)
+    def submit_summary_batch(
+        pool: ThreadPoolExecutor,
+        running: dict[Future, list[int]],
+        indices: list[int],
+    ) -> None:
+        running[
+            pool.submit(
+                summarize_batch,
+                summary_model,
+                [(i, chunks[i]) for i in indices],
+                args.summary_max_chars,
+                args.summary_fallback_chars,
+            )
+        ] = indices
 
-        def queue_for_embed(index: int) -> None:
-            pending_embed.append(index)
-            if len(pending_embed) >= batch_size:
-                submit_embed_batch(pending_embed[:batch_size])
-                del pending_embed[:batch_size]
+    if to_summarize:
+        summary_pool = ThreadPoolExecutor(max_workers=args.summary_workers)
+        running_summaries: dict[Future, list[int]] = {}
+        summary_batch_pos = 0
+        done = 0
+        generated = 0
+        reported_summary_done = 0
+        summary_errors: dict[str, int] = {}
+        summary_error_examples: dict[str, str] = {}
 
-        # 不需要等摘要的块（已有摘要或本次不生成摘要）直接进入 embedding 队列
-        for i in sorted(to_embed_set - to_summarize_set):
-            queue_for_embed(i)
+        try:
+            while summary_batch_pos < len(summary_batches) and len(running_summaries) < args.summary_workers:
+                submit_summary_batch(summary_pool, running_summaries, summary_batches[summary_batch_pos])
+                summary_batch_pos += 1
 
-        if to_summarize:
-            futures = {
-                summary_pool.submit(summarize_chunk, summary_model, chunks[i]): i
-                for i in to_summarize
-            }
-            done = 0
-            generated = 0
-            summary_errors: dict[str, int] = {}
-            for future in as_completed(futures):
-                index = futures[future]
-                session_id = session_ids[index]
-                summary, error = future.result()
-                if summary:
-                    summaries[session_id] = summary
-                    summary_buffer.append((session_id, summary))
-                    generated += 1
-                    if len(summary_buffer) >= SUMMARY_FLUSH_EVERY:
-                        store.set_summaries(summary_buffer)
-                        summary_buffer.clear()
-                elif error:
-                    summary_errors[error] = summary_errors.get(error, 0) + 1
-                done += 1
-                if done % 50 == 0 or done == len(to_summarize):
-                    print(f"  摘要 {done}/{len(to_summarize)}")
-                if index in to_embed_set:
-                    queue_for_embed(index)
-            store.set_summaries(summary_buffer)
-            summary_buffer.clear()
-            print(f"摘要完成：本次生成 {generated}/{len(to_summarize)}，全库 {len(summaries)}/{len(chunks)}")
-            if summary_errors:
-                detail = "，".join(f"{name}×{count}" for name, count in sorted(summary_errors.items()))
-                print(f"  [警告] {sum(summary_errors.values())} 条摘要请求失败（{detail}）；重跑 ingest 将自动补齐")
+            while running_summaries:
+                done_futures, _ = wait(set(running_summaries), return_when=FIRST_COMPLETED)
+                for future in done_futures:
+                    indices = running_summaries.pop(future)
+                    try:
+                        batch_summaries, batch_errors, batch_examples = future.result()
+                    except Exception as exc:
+                        batch_summaries = {}
+                        batch_errors = {type(exc).__name__: len(indices)}
+                        batch_examples = {type(exc).__name__: compact_error(exc)}
 
-        if pending_embed:
-            submit_embed_batch(pending_embed)
-            pending_embed.clear()
+                    for index, summary in batch_summaries.items():
+                        session_id = session_ids[index]
+                        summaries[session_id] = summary
+                        summary_buffer.append((session_id, summary))
+                        if len(summary_buffer) >= SUMMARY_FLUSH_EVERY:
+                            store.set_summaries(summary_buffer)
+                            summary_buffer.clear()
+                    generated += len(batch_summaries)
 
-        embedded = 0
-        for future in as_completed(embed_futures):
-            indices = embed_futures[future]
-            try:
-                vectors = future.result()
-            except Exception as exc:
-                embed_fail_sessions += len(indices)
-                print(f"\n[警告] 一批 embedding 生成失败（{len(indices)} 块）：{exc}")
-                continue
-            if vectors:
-                actual_dim = len(vectors[0])
-                recreated = store.ensure_vector_table_dimension(actual_dim)
-                if recreated:
-                    print(f"\n检测到 embedding 实际维度为 {actual_dim}，已按该维度重建 sessions_vec 向量表。")
+                    if batch_errors and not args.keep_going:
+                        summary_pool.shutdown(wait=False, cancel_futures=True)
+                        abort_model_error("摘要生成", batch_errors, batch_examples)
+
+                    merge_counts(summary_errors, batch_errors)
+                    merge_examples(summary_error_examples, batch_examples)
+
+                    done += len(indices)
+                    if done - reported_summary_done >= args.progress_every or done == len(to_summarize):
+                        print(f"  摘要 {done}/{len(to_summarize)}")
+                        reported_summary_done = done
+
+                    if summary_batch_pos < len(summary_batches):
+                        submit_summary_batch(summary_pool, running_summaries, summary_batches[summary_batch_pos])
+                        summary_batch_pos += 1
+        finally:
+            summary_pool.shutdown(wait=False, cancel_futures=True)
+
+        store.set_summaries(summary_buffer)
+        summary_buffer.clear()
+        print(f"摘要完成：本次生成 {generated}/{len(to_summarize)}，全库 {len(summaries)}/{len(chunks)}")
+        if summary_errors:
+            print(f"  [警告] {sum(summary_errors.values())} 条摘要请求失败（{format_error_counts(summary_errors)}）；重跑 ingest 将自动补齐")
+            for name, example in list(sorted(summary_error_examples.items()))[:3]:
+                print(f"    {name}: {example}")
+
+    embed_batches = [
+        sorted(to_embed_set)[start : start + batch_size]
+        for start in range(0, len(to_embed_set), batch_size)
+    ]
+
+    def submit_embed_batch(
+        pool: ThreadPoolExecutor,
+        running: dict[Future, list[int]],
+        indices: list[int],
+    ) -> None:
+        nonlocal submitted_embed_batches, submitted_embed_sessions, reported_submitted_sessions
+        inputs: list[str] = []
+        for i in indices:
+            summary = summaries.get(session_ids[i])
+            inputs.append(f"{summary}\n{chunks[i].text}" if summary else chunks[i].text)
+        running[pool.submit(embed, inputs)] = list(indices)
+        submitted_embed_batches += 1
+        submitted_embed_sessions += len(indices)
+        should_report = (
+            submitted_embed_sessions - reported_submitted_sessions >= args.progress_every
+            or submitted_embed_batches == total_embed_batches
+        )
+        if should_report:
+            print(
+                f"  embedding 已提交 {submitted_embed_sessions}/{len(to_embed_set)} 块"
+                f"（{submitted_embed_batches}/{total_embed_batches} 批）"
+            )
+            reported_submitted_sessions = submitted_embed_sessions
+
+    def finish_embed_future(future: Future, indices: list[int]) -> None:
+        nonlocal embedded, embed_fail_sessions, completed_embed_batches, reported_finished_sessions
+        completed_embed_batches += 1
+        try:
+            vectors = future.result()
+            if len(vectors) != len(indices):
+                raise RuntimeError(f"embedding 返回数量不一致：请求 {len(indices)} 条，返回 {len(vectors)} 条")
+        except Exception as exc:
+            embed_fail_sessions += len(indices)
+            errors = {type(exc).__name__: len(indices)}
+            examples = {type(exc).__name__: compact_error(exc)}
+            if not args.keep_going:
+                abort_model_error("embedding 生成", errors, examples)
+            print(f"\n[警告] 一批 embedding 生成失败（{len(indices)} 块）：{compact_error(exc)}")
+            return
+        if vectors:
+            actual_dim = len(vectors[0])
+            recreated = store.ensure_vector_table_dimension(actual_dim)
+            if recreated:
+                print(f"\n检测到 embedding 实际维度为 {actual_dim}，已按该维度重建 sessions_vec 向量表。")
+        try:
             store.insert_embeddings(
                 [
                     {"session_id": session_ids[i], "embedding": vector}
                     for i, vector in zip(indices, vectors)
                 ]
             )
-            embedded += len(vectors)
-            print(f"  embedding {embedded}/{len(to_embed_set)}", end="\r")
+        except Exception as exc:
+            embed_fail_sessions += len(indices)
+            errors = {type(exc).__name__: len(indices)}
+            examples = {type(exc).__name__: compact_error(exc)}
+            if not args.keep_going:
+                abort_model_error("embedding 写入", errors, examples)
+            print(f"\n[警告] 一批 embedding 写入失败（{len(indices)} 块）：{compact_error(exc)}")
+            return
+        embedded += len(vectors)
+        finished = embedded + embed_fail_sessions
+        should_report = (
+            finished - reported_finished_sessions >= args.progress_every
+            or completed_embed_batches == total_embed_batches
+        )
+        if should_report:
+            print(
+                f"  embedding 完成 {finished}/{len(to_embed_set)} 块"
+                f"（成功 {embedded}，失败 {embed_fail_sessions}；批次 {completed_embed_batches}/{total_embed_batches}）"
+            )
+            reported_finished_sessions = finished
+
+    if embed_batches:
+        embed_pool = ThreadPoolExecutor(max_workers=args.embed_workers)
+        running_embeds: dict[Future, list[int]] = {}
+        embed_batch_pos = 0
+        try:
+            while embed_batch_pos < len(embed_batches) and len(running_embeds) < args.embed_workers:
+                submit_embed_batch(embed_pool, running_embeds, embed_batches[embed_batch_pos])
+                embed_batch_pos += 1
+
+            while running_embeds:
+                done_futures, _ = wait(
+                    set(running_embeds),
+                    timeout=args.progress_interval,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done_futures:
+                    finished = embedded + embed_fail_sessions
+                    print(
+                        f"  embedding 等待中：完成 {finished}/{len(to_embed_set)} 块，"
+                        f"已提交 {submitted_embed_sessions}/{len(to_embed_set)} 块，"
+                        f"{len(running_embeds)} 批未返回"
+                    )
+                    continue
+                for future in done_futures:
+                    indices = running_embeds.pop(future)
+                    finish_embed_future(future, indices)
+                    if embed_batch_pos < len(embed_batches):
+                        submit_embed_batch(embed_pool, running_embeds, embed_batches[embed_batch_pos])
+                        embed_batch_pos += 1
+        finally:
+            embed_pool.shutdown(wait=False, cancel_futures=True)
 
     record_pending_files(pending_file_records)
 
     if embed_fail_sessions:
         print(f"\n[警告] {embed_fail_sessions} 块向量生成失败；消息库与其余索引已保留，重跑 ingest 将只补建缺失部分。")
     if to_embed_set:
-        print(f"\n向量索引完成（本次新建 {len(to_embed_set) - embed_fail_sessions} 块）。现在可以运行 python -m wechat_rag_agent.cli")
+        print(f"\n向量索引完成（本次写入 {embedded} 块，失败 {embed_fail_sessions} 块）。现在可以运行 python -m wechat_rag_agent.cli")
     else:
         print("\n索引更新完成。现在可以运行 python -m wechat_rag_agent.cli")
 
