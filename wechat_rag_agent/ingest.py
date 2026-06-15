@@ -11,19 +11,22 @@ from dotenv import load_dotenv
 from . import store
 from .chunker import Chunk, chunk_thread
 from .console import setup_utf8_console
-from .llm import chat_configured, chat_model, embed, embed_configured
+from .llm import chat_configured, embed, embed_configured, invoke_chat
 from .parser import is_weflow_export, parse_weflow
 
 
 load_dotenv()
 
 SUMMARY_PROMPT = "用一句话概括这段聊天讨论的主题和关键事项，直接输出概括，不要任何前缀。聊天内容：\n\n"
-SUMMARY_FLUSH_EVERY = 200
+SUMMARY_FLUSH_EVERY = 50
 DEFAULT_PROGRESS_EVERY = 50
 DEFAULT_PROGRESS_INTERVAL = 15.0
+DEFAULT_SUMMARY_WORKERS = 2
 DEFAULT_SUMMARY_BATCH_SIZE = 4
 DEFAULT_SUMMARY_MAX_CHARS = 3000
 DEFAULT_SUMMARY_FALLBACK_CHARS = 1200
+DEFAULT_EMBED_WORKERS = 4
+DEFAULT_EMBED_BATCH_SIZE = 32
 SUMMARY_BATCH_PROMPT = """请分别概括下面多个聊天块的主题和关键事项。
 只输出 JSON 数组，不要 Markdown，不要解释。
 数组长度应等于输入块数，每项格式为 {"id": 数字, "summary": "一句话摘要"}。
@@ -31,6 +34,8 @@ SUMMARY_BATCH_PROMPT = """请分别概括下面多个聊天块的主题和关键
 """
 SUMMARY_RETRY_SHORT_ERRORS = {"UnprocessableEntityError", "BadRequestError"}
 SUMMARY_SPLIT_BATCH_ERRORS = {"UnprocessableEntityError", "BadRequestError", "SummaryBatchParseError"}
+ENV_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+ENV_FALSE_VALUES = {"0", "false", "no", "n", "off"}
 
 
 def env_int(name: str, default: int) -> int:
@@ -51,6 +56,18 @@ def env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in ENV_TRUE_VALUES:
+        return True
+    if normalized in ENV_FALSE_VALUES:
+        return False
+    return default
 
 
 def positive_int(raw: str) -> int:
@@ -96,15 +113,30 @@ def parse_args() -> argparse.Namespace:
         dest="force_embeddings",
         help="强制重建向量索引",
     )
-    parser.add_argument("--summary-workers", type=positive_int, default=2, help="摘要生成并发数，默认 2")
+    parser.add_argument(
+        "--summary-workers",
+        type=positive_int,
+        default=max(1, env_int("SUMMARY_WORKERS", DEFAULT_SUMMARY_WORKERS)),
+        help="摘要生成并发数，默认 2；也可用 SUMMARY_WORKERS 配置",
+    )
     parser.add_argument(
         "--summary-batch-size",
         type=positive_int,
         default=max(1, env_int("SUMMARY_BATCH_SIZE", DEFAULT_SUMMARY_BATCH_SIZE)),
         help="每个摘要请求包含的会话块数量，默认 4；也可用 SUMMARY_BATCH_SIZE 配置",
     )
-    parser.add_argument("--embed-workers", type=positive_int, default=4, help="embedding 批次并发数，默认 4")
-    parser.add_argument("--embed-batch-size", type=positive_int, default=32, help="每个 embedding 请求批次的会话块数量，默认 32")
+    parser.add_argument(
+        "--embed-workers",
+        type=positive_int,
+        default=max(1, env_int("EMBED_WORKERS", DEFAULT_EMBED_WORKERS)),
+        help="embedding 批次并发数，默认 4；也可用 EMBED_WORKERS 配置",
+    )
+    parser.add_argument(
+        "--embed-batch-size",
+        type=positive_int,
+        default=max(1, env_int("EMBED_BATCH_SIZE", DEFAULT_EMBED_BATCH_SIZE)),
+        help="每个 embedding 请求批次的会话块数量，默认 32；也可用 EMBED_BATCH_SIZE 配置",
+    )
     parser.add_argument(
         "--summary-max-chars",
         type=positive_int,
@@ -132,9 +164,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keep-going",
         action="store_true",
-        help="摘要或 embedding 单批失败时继续处理其余批次；默认遇到模型/API错误立即停止",
+        default=env_bool("INGEST_KEEP_GOING", False),
+        help="摘要或 embedding 单批失败时继续处理其余批次；也可用 INGEST_KEEP_GOING=true 配置",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_false",
+        dest="keep_going",
+        help="即使 INGEST_KEEP_GOING=true，也在模型/API错误时立即停止",
+    )
+    args = parser.parse_args()
+    if args.summary_fallback_chars >= args.summary_max_chars:
+        args.summary_fallback_chars = max(0, args.summary_max_chars // 2)
+    return args
 
 
 def compact_error(exc: Exception, limit: int = 300) -> str:
@@ -234,7 +276,7 @@ def parse_summary_batch_response(raw: str, expected_ids: list[int]) -> dict[int,
 
 
 def summarize_once(model_name: str, text: str) -> str | None:
-    res = chat_model(model_name).invoke(SUMMARY_PROMPT + text)
+    res = invoke_chat(SUMMARY_PROMPT + text, model_name)
     summary = str(res.content).strip()
     return summary or None
 
@@ -248,7 +290,7 @@ def summarize_batch_once(
         {"id": local_id, "text": chunk.text[:max_chars]}
         for local_id, (_, chunk) in enumerate(items, start=1)
     ]
-    res = chat_model(model_name).invoke(SUMMARY_BATCH_PROMPT + json.dumps(payload, ensure_ascii=False))
+    res = invoke_chat(SUMMARY_BATCH_PROMPT + json.dumps(payload, ensure_ascii=False), model_name)
     expected_ids = list(range(1, len(items) + 1))
     return parse_summary_batch_response(str(res.content), expected_ids)
 
@@ -704,7 +746,7 @@ def main() -> None:
         for i in indices:
             summary = summaries.get(session_ids[i])
             inputs.append(f"{summary}\n{chunks[i].text}" if summary else chunks[i].text)
-        running[pool.submit(embed, inputs)] = list(indices)
+        running[pool.submit(embed, inputs, args.embed_batch_size)] = list(indices)
         submitted_embed_batches += 1
         submitted_embed_sessions += len(indices)
         should_report = (
