@@ -41,7 +41,10 @@ def _apply_filters(rows: list[dict[str, Any]], filters: dict[str, Any]) -> list[
 
 def semantic_search(args: dict[str, Any]) -> dict[str, Any]:
     top_n = min(int(args.get("limit") or 8), 20)
-    vec_ready = store.has_vec() and embed_configured() and len(store.get_all_session_ids_without_embedding()) == 0
+    vector_enabled = store.has_vec() and embed_configured()
+    indexed_vector_ids = store.get_session_ids_with_embedding() if vector_enabled else set()
+    missing_vector_count = len(store.get_all_session_ids_without_embedding()) if vector_enabled else 0
+    vec_ready = bool(indexed_vector_ids)
 
     fts_hits = store.fts_search_sessions(args["query"], 20)
     vec_hits: list[dict[str, int]] = []
@@ -51,6 +54,8 @@ def semantic_search(args: dict[str, Any]) -> dict[str, Any]:
         try:
             query_vec = embed([args["query"]])[0]
             vec_hits = store.vector_search_sessions(query_vec, 20)
+            if missing_vector_count:
+                note = f"向量索引不完整（缺少 {missing_vector_count} 个会话块），本次语义结果已结合现有向量和全文检索；重跑 ingest 可自动补齐"
         except Exception as exc:
             note = f"向量检索失败（{exc}），本次结果仅来自全文检索"
     else:

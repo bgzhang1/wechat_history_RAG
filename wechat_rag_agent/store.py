@@ -95,6 +95,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_time   ON messages(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sender ON messages(sender);
         CREATE INDEX IF NOT EXISTS idx_seq    ON messages(thread, seq);
+        CREATE INDEX IF NOT EXISTS idx_thread_time ON messages(thread, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_sender_time ON messages(sender, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_self_time   ON messages(is_self, timestamp);
 
         CREATE TABLE IF NOT EXISTS sessions (
           session_id   INTEGER PRIMARY KEY,
@@ -108,6 +111,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
           text_hash    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_thread ON sessions(thread);
+        CREATE INDEX IF NOT EXISTS idx_sessions_time ON sessions(start_time, end_time);
 
         CREATE TABLE IF NOT EXISTS msg_session (
           msg_id     TEXT PRIMARY KEY,
