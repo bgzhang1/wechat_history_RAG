@@ -12,20 +12,20 @@
 - 将聊天切分为会话块，支持摘要和向量索引。
 - 未配置 embedding 时仍可使用全文检索。
 - 通过 LangChain tools 让 Agent 自动选择关键词检索、语义检索、上下文追溯、时间浏览和统计工具。
+- FastAPI 后端提供 SSE 流式对话接口，支持 Web 前端接入。
 - 本地隐私数据默认不提交到 Git。
 
 ## 目录结构
 
 ```text
 wechat_agent/
-  wechat_rag_agent/      # Python 源码
+  wechat_rag_agent/      # 核心 Python 库（Agent、检索、导入、数据层）
+  backend/               # FastAPI 后端（SSE 对话、设置、导入、统计）
   docs/                  # 技术文档
   runtime/               # 本地 SQLite 数据库，Git 忽略
   local/                 # 本地聊天 JSON 和私有资料，Git 忽略
   requirements.txt       # Python 依赖
   .env.example           # 环境变量模板，不包含真实密钥
-  README.md
-  CHANGELOG.md
 ```
 
 建议把 WeFlow 导出的 JSON 放在 `local/data/` 下。`runtime/`、`local/`、`.env`、数据库、日志和缓存都不会提交。
@@ -42,13 +42,20 @@ copy .env.example .env
 
 python -m wechat_rag_agent.scripts.check
 python -m wechat_rag_agent.ingest local/data
-python -m wechat_rag_agent.cli
 ```
 
-默认数据库路径是 `runtime/chat.db`。如需修改，在 `.env` 中设置：
+### 启动 Web 后端
 
-```env
-CHAT_DB=runtime/chat.db
+```bash
+python -m uvicorn backend.main:app --reload
+```
+
+服务默认监听 `http://localhost:8000`。API 文档见 [backend/API_DOCS.md](backend/API_DOCS.md)，交互式文档访问 `http://localhost:8000/docs`。
+
+### 启动命令行交互
+
+```bash
+python -m wechat_rag_agent.cli
 ```
 
 ## 常用命令
@@ -87,12 +94,6 @@ python -m wechat_rag_agent.ingest local/data --force-embeddings
 python -m wechat_rag_agent.ingest local/data --force-rebuild
 ```
 
-启动聊天检索：
-
-```bash
-python -m wechat_rag_agent.cli
-```
-
 ## 配置说明
 
 主聊天模型是交互式 Agent 必需配置：
@@ -123,7 +124,7 @@ SUMMARY_MODEL=your-chat-model
 ## 开发验证
 
 ```bash
-python -m compileall -q wechat_rag_agent
+python -m compileall -q wechat_rag_agent backend
 ```
 
 如果已有本地数据库，也可以运行：

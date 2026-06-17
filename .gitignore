@@ -8,8 +8,6 @@ local/
 runtime/
 bench/
 data/
-chat.db
-chat.db-*
 *.db
 *.db-shm
 *.db-wal
@@ -28,10 +26,7 @@ __pycache__/
 .venv/
 venv/
 
-# Node/TypeScript leftovers are not part of the Python agent source.
+# Node (frontend)
 node_modules/
-package.json
-package-lock.json
-tsconfig.json
 dist/
 coverage/
