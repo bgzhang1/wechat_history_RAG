@@ -52,7 +52,7 @@ def _remote_api_call(
     for attempt in range(attempts):
         try:
             return call()
-        except Exception as exc:
+        except Exception:
             if attempt + 1 >= attempts:
                 raise
             if retry_sleep:
@@ -64,13 +64,47 @@ CHAT_MODEL_OVERRIDE: str | None = None
 CHAT_TIMEOUT_OVERRIDE: float | None = None
 CHAT_TEMPERATURE: float = 0.0
 
+
+def _configured_value(value: str | None) -> bool:
+    return bool(value and value.strip())
+
+
+def chat_config_status() -> dict[str, Any]:
+    model = CHAT_MODEL_OVERRIDE or os.getenv("CHAT_MODEL")
+    required = {
+        "CHAT_BASE_URL": os.getenv("CHAT_BASE_URL"),
+        "CHAT_API_KEY": os.getenv("CHAT_API_KEY"),
+        "CHAT_MODEL": model,
+    }
+    missing = [name for name, value in required.items() if not _configured_value(value)]
+    return {
+        "configured": not missing,
+        "missing": missing,
+        "model": model or "",
+        "using_model_override": bool(CHAT_MODEL_OVERRIDE),
+    }
+
+
 def chat_configured() -> bool:
-    has_env = bool(os.getenv("CHAT_BASE_URL") and os.getenv("CHAT_API_KEY") and os.getenv("CHAT_MODEL"))
-    return has_env or bool(CHAT_MODEL_OVERRIDE)
+    return bool(chat_config_status()["configured"])
+
+
+def embed_config_status() -> dict[str, Any]:
+    required = {
+        "EMBED_BASE_URL": os.getenv("EMBED_BASE_URL"),
+        "EMBED_API_KEY": os.getenv("EMBED_API_KEY"),
+        "EMBED_MODEL": os.getenv("EMBED_MODEL"),
+    }
+    missing = [name for name, value in required.items() if not _configured_value(value)]
+    return {
+        "configured": not missing,
+        "missing": missing,
+        "model": os.getenv("EMBED_MODEL") or "",
+    }
 
 
 def embed_configured() -> bool:
-    return bool(os.getenv("EMBED_BASE_URL") and os.getenv("EMBED_API_KEY") and os.getenv("EMBED_MODEL"))
+    return bool(embed_config_status()["configured"])
 
 
 @lru_cache(maxsize=8)
@@ -87,9 +121,14 @@ def _chat_model_cached(model: str, timeout: float, temperature: float) -> ChatOp
 
 def chat_model(model: str | None = None) -> ChatOpenAI:
     if not chat_configured():
-        raise RuntimeError("未配置主模型：请在 .env 中设置 CHAT_BASE_URL / CHAT_API_KEY / CHAT_MODEL")
+        missing = ", ".join(chat_config_status()["missing"])
+        raise RuntimeError(f"Chat model is not configured. Missing: {missing}")
     actual_model = model or CHAT_MODEL_OVERRIDE or os.environ.get("CHAT_MODEL", "")
-    actual_timeout = CHAT_TIMEOUT_OVERRIDE if CHAT_TIMEOUT_OVERRIDE is not None else _env_float("CHAT_TIMEOUT", 300.0, minimum=1.0)
+    actual_timeout = (
+        CHAT_TIMEOUT_OVERRIDE
+        if CHAT_TIMEOUT_OVERRIDE is not None
+        else _env_float("CHAT_TIMEOUT", 300.0, minimum=1.0)
+    )
     return _chat_model_cached(actual_model, actual_timeout, CHAT_TEMPERATURE)
 
 
@@ -102,8 +141,6 @@ def invoke_chat(input: Any, model: str | None = None) -> Any:
 
 @lru_cache(maxsize=2)
 def _embed_model_cached(model: str) -> OpenAIEmbeddings:
-    # check_embedding_ctx_length=False：直接发送原文，避免用 tiktoken（OpenAI 分词器）
-    # 给 bge-m3 等非 OpenAI 模型做本地分词切片，更快也更准确。
     return OpenAIEmbeddings(
         model=model,
         base_url=os.environ["EMBED_BASE_URL"],
@@ -116,7 +153,8 @@ def _embed_model_cached(model: str) -> OpenAIEmbeddings:
 
 def embed_model() -> OpenAIEmbeddings:
     if not embed_configured():
-        raise RuntimeError("未配置 Embedding：请在 .env 中设置 EMBED_BASE_URL / EMBED_API_KEY / EMBED_MODEL")
+        missing = ", ".join(embed_config_status()["missing"])
+        raise RuntimeError(f"Embedding model is not configured. Missing: {missing}")
     return _embed_model_cached(os.environ["EMBED_MODEL"])
 
 

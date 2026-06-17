@@ -605,30 +605,136 @@ def browse(args: dict[str, Any]) -> dict[str, Any]:
     return {"total_count": total, "returned": len(rows), "offset": offset, "messages": [_to_api_msg(row) for row in rows]}
 
 
-def stats() -> dict[str, Any]:
+def stats_summary() -> dict[str, Any]:
     conn = db()
     overall = conn.execute("SELECT COUNT(*) total, MIN(timestamp) earliest, MAX(timestamp) latest FROM messages").fetchone()
-    threads = conn.execute(
-        """
-        SELECT thread, COUNT(*) count, MIN(timestamp) earliest, MAX(timestamp) latest
-        FROM messages GROUP BY thread ORDER BY count DESC
-        """
-    ).fetchall()
-    senders = conn.execute(
-        """
-        SELECT sender, MAX(is_self) is_self, COUNT(*) count
-        FROM messages GROUP BY sender ORDER BY count DESC LIMIT 50
-        """
-    ).fetchall()
     types = conn.execute("SELECT msg_type, COUNT(*) count FROM messages GROUP BY msg_type ORDER BY count DESC").fetchall()
     session_count = conn.execute("SELECT COUNT(*) c FROM sessions").fetchone()["c"]
+    thread_count = conn.execute("SELECT COUNT(*) c FROM (SELECT 1 FROM messages GROUP BY thread)").fetchone()["c"]
+    sender_count = conn.execute("SELECT COUNT(*) c FROM (SELECT 1 FROM messages GROUP BY sender)").fetchone()["c"]
     return {
         "total_messages": overall["total"],
         "time_span": {"earliest": overall["earliest"], "latest": overall["latest"]},
-        "threads": [dict(row) for row in threads],
-        "senders": [{**dict(row), "is_self": True if row["is_self"] else None} for row in senders],
         "message_types": [dict(row) for row in types],
         "indexed_session_chunks": session_count,
+        "thread_count": thread_count,
+        "sender_count": sender_count,
+    }
+
+
+def stats_threads(limit: int | None = 50, offset: int = 0) -> dict[str, Any]:
+    conn = db()
+    safe_offset = max(0, int(offset))
+    params: list[Any] = []
+    limit_sql = ""
+    if limit is not None:
+        safe_limit = max(1, min(int(limit), 500))
+        limit_sql = " LIMIT ? OFFSET ?"
+        params.extend([safe_limit, safe_offset])
+    rows = conn.execute(
+        """
+        SELECT thread, COUNT(*) count, MIN(timestamp) earliest, MAX(timestamp) latest
+        FROM messages GROUP BY thread ORDER BY count DESC
+        """ + limit_sql,
+        params,
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) c FROM (SELECT 1 FROM messages GROUP BY thread)").fetchone()["c"]
+    return {
+        "total_count": total,
+        "returned": len(rows),
+        "offset": safe_offset if limit is not None else 0,
+        "items": [dict(row) for row in rows],
+    }
+
+
+def stats_senders(limit: int | None = 50, offset: int = 0) -> dict[str, Any]:
+    conn = db()
+    safe_offset = max(0, int(offset))
+    params: list[Any] = []
+    limit_sql = ""
+    if limit is not None:
+        safe_limit = max(1, min(int(limit), 500))
+        limit_sql = " LIMIT ? OFFSET ?"
+        params.extend([safe_limit, safe_offset])
+    rows = conn.execute(
+        """
+        SELECT sender, MAX(is_self) is_self, COUNT(*) count
+        FROM messages GROUP BY sender ORDER BY count DESC
+        """ + limit_sql,
+        params,
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) c FROM (SELECT 1 FROM messages GROUP BY sender)").fetchone()["c"]
+    return {
+        "total_count": total,
+        "returned": len(rows),
+        "offset": safe_offset if limit is not None else 0,
+        "items": [{**dict(row), "is_self": True if row["is_self"] else None} for row in rows],
+    }
+
+
+def stats(
+    thread_limit: int | None = None,
+    thread_offset: int = 0,
+    sender_limit: int | None = 50,
+    sender_offset: int = 0,
+) -> dict[str, Any]:
+    summary = stats_summary()
+    threads = stats_threads(limit=thread_limit, offset=thread_offset)
+    senders = stats_senders(limit=sender_limit, offset=sender_offset)
+    return {
+        **summary,
+        "threads": threads["items"],
+        "threads_page": {key: value for key, value in threads.items() if key != "items"},
+        "senders": senders["items"],
+        "senders_page": {key: value for key, value in senders.items() if key != "items"},
+    }
+
+
+def suggest_entities(query: str = "", limit: int = 10) -> dict[str, Any]:
+    conn = db()
+    safe_limit = max(1, min(int(limit), 50))
+    query = query.strip()
+    params: list[Any] = []
+    where_thread = ""
+    where_sender = ""
+    if query:
+        where_thread = "WHERE thread LIKE '%' || ? || '%'"
+        where_sender = "WHERE sender LIKE '%' || ? || '%'"
+        params.append(query)
+
+    thread_rows = conn.execute(
+        f"""
+        SELECT 'thread' AS type, thread AS value, COUNT(*) AS count, NULL AS is_self
+        FROM messages
+        {where_thread}
+        GROUP BY thread
+        ORDER BY count DESC
+        LIMIT ?
+        """,
+        [*params, safe_limit],
+    ).fetchall()
+
+    sender_params = [query] if query else []
+    sender_rows = conn.execute(
+        f"""
+        SELECT 'sender' AS type, sender AS value, COUNT(*) AS count, MAX(is_self) AS is_self
+        FROM messages
+        {where_sender}
+        GROUP BY sender
+        ORDER BY count DESC
+        LIMIT ?
+        """,
+        [*sender_params, safe_limit],
+    ).fetchall()
+
+    items = [dict(row) for row in [*thread_rows, *sender_rows]]
+    items.sort(key=lambda item: int(item["count"]), reverse=True)
+    for item in items:
+        item["is_self"] = True if item["is_self"] else None
+
+    return {
+        "query": query,
+        "items": items[:safe_limit],
     }
 
 

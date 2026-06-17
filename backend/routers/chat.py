@@ -1,60 +1,122 @@
-"""Chat router — SSE streaming endpoint wrapping the agent loop."""
+"""Chat router - SSE streaming endpoint wrapping the agent loop."""
 
 from __future__ import annotations
 
-import uuid
+import json
+from collections.abc import Generator
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from pydantic import BaseModel, Field
 
+import core.agent as agent_module
 from core.llm import chat_configured
 
-from ..agent_stream import stream_agent
-from ..schemas import ChatRequest, ChatResponse
+from .. import session_store
+from ..agent_stream import clear_abort_flag, set_abort_flag, stream_agent
+from ..schemas import ChatRequest
 
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
-# In-memory session store: { session_id: list[BaseMessage] }
-# For production, replace with Redis or a persistent store.
-_sessions: dict[str, list[BaseMessage]] = {}
 
-MAX_SESSIONS = 200
+class RenameSessionRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=120)
 
 
-def _gc_sessions() -> None:
-    """Evict oldest sessions when the pool is full."""
-    while len(_sessions) > MAX_SESSIONS:
-        oldest = next(iter(_sessions))
-        del _sessions[oldest]
+class BatchDeleteSessionsRequest(BaseModel):
+    session_ids: list[str] = Field(..., min_length=1, max_length=200)
 
 
-def _get_or_create_session(session_id: str | None) -> tuple[str, list[BaseMessage]]:
-    if session_id and session_id in _sessions:
-        return session_id, _sessions[session_id]
-    new_id = session_id or str(uuid.uuid4())
-    _sessions[new_id] = []
-    _gc_sessions()
-    return new_id, _sessions[new_id]
+def _to_history(rows: list[dict[str, Any]]) -> list[BaseMessage]:
+    history: list[BaseMessage] = []
+    for row in rows:
+        if row["role"] == "user":
+            history.append(HumanMessage(content=row["content"]))
+        elif row["role"] == "assistant":
+            history.append(AIMessage(content=row["content"]))
+    return history
 
 
-@router.post("/chat", summary="与 Agent 对话（SSE 流式）")
+def _parse_sse_event(payload: str) -> tuple[str | None, dict[str, Any] | None]:
+    event_name: str | None = None
+    data_lines: list[str] = []
+    for line in payload.splitlines():
+        if line.startswith("event:"):
+            event_name = line.removeprefix("event:").strip()
+        elif line.startswith("data:"):
+            data_lines.append(line.removeprefix("data:").strip())
+
+    if not data_lines:
+        return event_name, None
+
+    try:
+        return event_name, json.loads("\n".join(data_lines))
+    except json.JSONDecodeError:
+        return event_name, None
+
+
+def _stream_and_persist(
+    question: str,
+    history: list[BaseMessage],
+    session_id: str,
+) -> Generator[str, None, None]:
+    final_answer: str | None = None
+    error_detail: str | None = None
+    saw_done = False
+    persisted = False
+
+    try:
+        yield (
+            "event: session\n"
+            f"data: {json.dumps({'session_id': session_id, 'status': 'running'}, ensure_ascii=False)}\n\n"
+        )
+        for payload in stream_agent(question, history, session_id):
+            event_name, data = _parse_sse_event(payload)
+            if event_name == "done" and data is not None:
+                final_answer = str(data.get("answer", ""))
+                saw_done = True
+                session_store.append_exchange(session_id, question, final_answer)
+                persisted = True
+            elif event_name == "error" and data is not None:
+                error_detail = str(data.get("detail", "Agent execution failed"))
+            yield payload
+
+        if saw_done and not persisted:
+            session_store.append_exchange(session_id, question, final_answer or "")
+        elif error_detail:
+            session_store.finish(session_id, "error", error_detail)
+        else:
+            session_store.finish(session_id, "idle", "stream ended before completion")
+    except GeneratorExit:
+        session_store.finish(session_id, "idle", "client disconnected")
+        raise
+    except Exception as exc:
+        session_store.finish(session_id, "error", f"{type(exc).__name__}: {exc}")
+        raise
+
+
+@router.post("/chat", summary="Chat with the Agent via SSE")
 def chat(req: ChatRequest) -> StreamingResponse:
-    """
-    发送问题给 Agent，以 SSE 流式返回工具调用过程和最终回答。
-    """
     if not chat_configured():
         raise HTTPException(
             status_code=503,
-            detail="主模型未配置。请在 .env 中设置 CHAT_BASE_URL / CHAT_API_KEY / CHAT_MODEL。",
+            detail="Chat model is not configured. Set CHAT_BASE_URL, CHAT_API_KEY, and CHAT_MODEL.",
         )
 
-    session_id, history = _get_or_create_session(req.session_id)
+    session = session_store.get_or_create_session(req.session_id)
+    session_id = session["session_id"]
+    if not session_store.try_begin(session_id):
+        raise HTTPException(status_code=409, detail="This session is already generating a response.")
+    clear_abort_flag(session_id)
+
+    rows = session_store.get_messages(session_id, limit=agent_module.MAX_HISTORY_MESSAGES)
+    history = _to_history(rows)
 
     return StreamingResponse(
-        stream_agent(req.question, history, session_id),
+        _stream_and_persist(req.question, history, session_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -63,52 +125,64 @@ def chat(req: ChatRequest) -> StreamingResponse:
     )
 
 
-@router.delete("/chat/{session_id}", summary="清除会话历史")
+@router.get("/chat/sessions", summary="List chat sessions")
+def list_sessions(
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[dict[str, Any]]:
+    return session_store.list_sessions(limit=limit, offset=offset)
+
+
+@router.delete("/chat/sessions", summary="Delete multiple chat sessions")
+def batch_delete_sessions(req: BatchDeleteSessionsRequest) -> dict[str, Any]:
+    return session_store.delete_sessions(req.session_ids)
+
+
+@router.post("/chat/sessions/delete", summary="Delete multiple chat sessions")
+def batch_delete_sessions_post(req: BatchDeleteSessionsRequest) -> dict[str, Any]:
+    return session_store.delete_sessions(req.session_ids)
+
+
+@router.delete("/chat/{session_id}", summary="Delete a chat session")
 def delete_session(session_id: str) -> dict[str, str]:
-    """删除指定会话的聊天历史。"""
-    removed = _sessions.pop(session_id, None)
-    if removed is None:
-        raise HTTPException(status_code=404, detail=f"会话 {session_id} 不存在")
-    return {"message": f"会话 {session_id} 已删除"}
+    if not session_store.delete_session(session_id):
+        raise HTTPException(status_code=404, detail=f"Session {session_id} does not exist.")
+    return {"message": f"Session {session_id} deleted."}
 
 
-@router.get("/chat/{session_id}/messages", summary="获取会话历史消息")
-def get_session_messages(session_id: str) -> list[dict[str, str]]:
-    """获取指定会话的历史消息记录。"""
-    if session_id not in _sessions:
-        raise HTTPException(status_code=404, detail=f"会话 {session_id} 不存在")
-    
-    msgs = []
-    for m in _sessions[session_id]:
-        if isinstance(m, HumanMessage):
-            msgs.append({"role": "user", "content": str(m.content)})
-        elif isinstance(m, AIMessage):
-            msgs.append({"role": "assistant", "content": str(m.content)})
-    return msgs
+@router.patch("/chat/{session_id}", summary="Rename a chat session")
+def rename_session(session_id: str, req: RenameSessionRequest) -> dict[str, Any]:
+    try:
+        session = session_store.rename_session(session_id, req.title)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} does not exist.")
+    return session
 
 
-@router.post("/chat/{session_id}/abort", summary="终止会话生成")
+@router.get("/chat/{session_id}/messages", summary="Get chat session messages")
+def get_session_messages(session_id: str) -> list[dict[str, Any]]:
+    if session_store.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} does not exist.")
+    return session_store.get_messages(session_id)
+
+
+@router.get("/chat/{session_id}/status", summary="Get chat session status")
+def get_session_status(session_id: str) -> dict[str, Any]:
+    session = session_store.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} does not exist.")
+    return session
+
+
+@router.post("/chat/{session_id}/abort", summary="Abort session generation")
 def abort_session(session_id: str) -> dict[str, str]:
-    """强制终止指定会话正在进行的生成任务。"""
-    if session_id not in _sessions:
-        raise HTTPException(status_code=404, detail=f"会话 {session_id} 不存在")
-    
-    from ..agent_stream import set_abort_flag
+    abort_state = session_store.request_abort(session_id)
+    if abort_state == "missing":
+        raise HTTPException(status_code=404, detail=f"Session {session_id} does not exist.")
+    if abort_state == "idle":
+        return {"message": "No active generation for this session.", "status": "idle"}
+
     set_abort_flag(session_id)
-    return {"message": "已发送终止指令"}
-
-
-@router.get("/chat/sessions", summary="列出活跃会话")
-def list_sessions() -> list[dict[str, Any]]:
-    """列出所有活跃会话及其消息数。"""
-    return [
-        {
-            "session_id": sid,
-            "message_count": len(msgs),
-            "last_question": next(
-                (m.content for m in reversed(msgs) if isinstance(m, HumanMessage)),
-                None,
-            ),
-        }
-        for sid, msgs in _sessions.items()
-    ]
+    return {"message": "Abort requested.", "status": "aborting"}
