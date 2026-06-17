@@ -50,7 +50,7 @@ def db() -> sqlite3.Connection:
     if _conn is not None:
         return _conn
 
-    _conn = sqlite3.connect(_sqlite_path(DB_PATH), timeout=30)
+    _conn = sqlite3.connect(_sqlite_path(DB_PATH), timeout=30, check_same_thread=False)
     _conn.row_factory = sqlite3.Row
     _conn.execute("PRAGMA journal_mode = WAL")
     _conn.execute("PRAGMA busy_timeout = 30000")

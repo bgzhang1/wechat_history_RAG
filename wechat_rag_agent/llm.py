@@ -60,8 +60,13 @@ def _remote_api_call(
     raise RuntimeError("remote API retry loop exited unexpectedly")
 
 
+CHAT_MODEL_OVERRIDE: str | None = None
+CHAT_TIMEOUT_OVERRIDE: float | None = None
+CHAT_TEMPERATURE: float = 0.0
+
 def chat_configured() -> bool:
-    return bool(os.getenv("CHAT_BASE_URL") and os.getenv("CHAT_API_KEY") and os.getenv("CHAT_MODEL"))
+    has_env = bool(os.getenv("CHAT_BASE_URL") and os.getenv("CHAT_API_KEY") and os.getenv("CHAT_MODEL"))
+    return has_env or bool(CHAT_MODEL_OVERRIDE)
 
 
 def embed_configured() -> bool:
@@ -69,13 +74,13 @@ def embed_configured() -> bool:
 
 
 @lru_cache(maxsize=8)
-def _chat_model_cached(model: str) -> ChatOpenAI:
+def _chat_model_cached(model: str, timeout: float, temperature: float) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
         base_url=os.environ["CHAT_BASE_URL"],
         api_key=os.environ["CHAT_API_KEY"],
-        temperature=0,
-        timeout=_env_float("CHAT_TIMEOUT", 300.0, minimum=1.0),
+        temperature=temperature,
+        timeout=timeout,
         max_retries=_env_int("CHAT_MAX_RETRIES", 3, minimum=0),
     )
 
@@ -83,7 +88,9 @@ def _chat_model_cached(model: str) -> ChatOpenAI:
 def chat_model(model: str | None = None) -> ChatOpenAI:
     if not chat_configured():
         raise RuntimeError("未配置主模型：请在 .env 中设置 CHAT_BASE_URL / CHAT_API_KEY / CHAT_MODEL")
-    return _chat_model_cached(model or os.environ["CHAT_MODEL"])
+    actual_model = model or CHAT_MODEL_OVERRIDE or os.environ.get("CHAT_MODEL", "")
+    actual_timeout = CHAT_TIMEOUT_OVERRIDE if CHAT_TIMEOUT_OVERRIDE is not None else _env_float("CHAT_TIMEOUT", 300.0, minimum=1.0)
+    return _chat_model_cached(actual_model, actual_timeout, CHAT_TEMPERATURE)
 
 
 def invoke_chat(input: Any, model: str | None = None) -> Any:

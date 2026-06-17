@@ -13,6 +13,11 @@ from .tools import TOOLS, TOOLS_BY_NAME
 MAX_ROUNDS = 100
 MAX_HISTORY_MESSAGES = 40
 
+ENABLED_TOOLS: list[str] = ["search_messages", "semantic_search", "get_context", "browse_by_time", "get_stats"]
+
+def get_active_tools() -> list[Any]:
+    return [t for t in TOOLS if t.name in ENABLED_TOOLS]
+
 SYSTEM_PROMPT = """你是微信聊天记录检索助手，通过检索工具查找并回答用户关于聊天记录的问题。
 
 # 工具路由规则
