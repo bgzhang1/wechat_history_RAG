@@ -1,5 +1,18 @@
 # 更新日志
 
+## 2026-06-17
+
+### 架构演进与全量重构
+- **新增 FastAPI 后端**：在 `core/` 基础之上新增 `backend/` 模块，提供完整的 RESTful API 与 SSE (Server-Sent Events) 流式对话接口。
+- **SSE 流式输出**：`agent_stream.py` 实现了 Agent 执行过程的可视化流推，支持 `tool_call`（参数预览）、`tool_result`（结果摘要摘要）、`text`（打字机）和 `done` 事件。前端可据此渲染思考过程。
+- **全量异步化能力暴露**：支持通过 API 触发大模型摘要和 SQLite 向量化建库任务（`POST /api/ingest/start`），提供任务进度查询和日志轮询。
+- **动态系统设置 API**：支持在不重启服务的情况下动态调整 `system_prompt`、`chat_temperature`、开启/关闭指定工具等参数。
+- **统一大盘状态查询**：提供 `/api/stats` 汇总接口，及 `/api/health` 检查模型配置等依赖状态，支撑 Web 引导页逻辑。
+- **项目结构精简与重命名**：
+  - 核心处理引擎由 `wechat_rag_agent` 改名为 `core`，作为后端逻辑支撑底座。
+  - 移除了未投入实质使用的空壳前端目录 `frontend/`、旧版 Node 测试工具 `legacy-node/` 以及多余的 benchmark 产物。
+  - `README.md` 与文档路径全部重构对齐。
+
 ## 2026-06-16
 
 ### 文档与检索优化
