@@ -1,1 +1,1 @@
-"""FastAPI backend wrapping wechat_rag_agent functionality."""
+"""FastAPI backend wrapping core functionality."""

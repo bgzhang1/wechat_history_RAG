@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from wechat_rag_agent.llm import chat_configured
+from core.llm import chat_configured
 
 from ..agent_stream import stream_agent
 from ..schemas import ChatRequest, ChatResponse

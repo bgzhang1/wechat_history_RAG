@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from wechat_rag_agent import store
+from core import store
 
 
 router = APIRouter(prefix="/api", tags=["stats"])

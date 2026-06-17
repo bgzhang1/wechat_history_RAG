@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import wechat_rag_agent.agent as agent_module
-import wechat_rag_agent.llm as llm_module
+import core.agent as agent_module
+import core.llm as llm_module
 from fastapi import APIRouter
 
 from ..schemas import SettingsModel

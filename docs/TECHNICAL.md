@@ -49,7 +49,7 @@ flowchart LR
 
 ```text
 wechat_agent/
-  wechat_rag_agent/
+  core/
     __init__.py
     agent.py          # Agent 主循环、系统提示词、工具调用调度
     chunker.py        # 将连续聊天消息切分为会话块
@@ -266,7 +266,7 @@ USING vec0(session_id INTEGER PRIMARY KEY, embedding FLOAT[N]);
 入口：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data
+python -m core.ingest local/data
 ```
 
 ### 7.1 文件收集
@@ -520,61 +520,61 @@ copy .env.example .env
 检查模型端点：
 
 ```bash
-python -m wechat_rag_agent.scripts.check
+python -m core.scripts.check
 ```
 
 导入目录：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data
+python -m core.ingest local/data
 ```
 
 导入单个文件：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data/chat.json
+python -m core.ingest local/data/chat.json
 ```
 
 跳过摘要：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --no-summary
+python -m core.ingest local/data --no-summary
 ```
 
 强制重建全文索引：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --force-fts
+python -m core.ingest local/data --force-fts
 ```
 
 强制重建会话块：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --force-chunks
+python -m core.ingest local/data --force-chunks
 ```
 
 强制重建摘要：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --force-summary
+python -m core.ingest local/data --force-summary
 ```
 
 强制重建向量：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --force-embeddings
+python -m core.ingest local/data --force-embeddings
 ```
 
 全量重建：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --force-rebuild
+python -m core.ingest local/data --force-rebuild
 ```
 
 启动交互式 Agent：
 
 ```bash
-python -m wechat_rag_agent.cli
+python -m core.cli
 ```
 
 ## 11. 错误处理和恢复
@@ -598,7 +598,7 @@ python -m wechat_rag_agent.cli
 如需不中断：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --keep-going
+python -m core.ingest local/data --keep-going
 ```
 
 ### 11.5 Embedding 失败
@@ -648,7 +648,7 @@ python -m wechat_rag_agent.ingest local/data --keep-going
 当前目录导入只扫描第一层 JSON。可以新增：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --recursive
+python -m core.ingest local/data --recursive
 ```
 
 适合按联系人或日期分目录保存导出文件的场景。
@@ -718,8 +718,8 @@ CREATE TABLE schema_migrations (
 
 可以新增：
 
-- `python -m wechat_rag_agent.scripts.export --format jsonl`
-- `python -m wechat_rag_agent.scripts.backup runtime/chat.db`
+- `python -m core.scripts.export --format jsonl`
+- `python -m core.scripts.backup runtime/chat.db`
 
 对本地隐私数据项目来说，备份和可迁移性很重要。
 
@@ -740,39 +740,39 @@ CREATE TABLE schema_migrations (
 - 修改切块策略后，通常需要运行 `--force-chunks`，并视情况重建摘要和向量。
 - 更换 embedding 模型后，建议运行 `--force-embeddings`。如果维度变化，程序会自动重建向量表。
 - 调整摘要 prompt 后，建议运行 `--force-summary --force-embeddings`，因为摘要会影响 embedding 输入。
-- 本地开发验证至少运行 `python -m compileall -q wechat_rag_agent`。
+- 本地开发验证至少运行 `python -m compileall -q core`。
 
 ## 16. 推荐维护流程
 
 日常新增聊天记录：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data
-python -m wechat_rag_agent.cli
+python -m core.ingest local/data
+python -m core.cli
 ```
 
 模型配置变更后：
 
 ```bash
-python -m wechat_rag_agent.scripts.check
-python -m wechat_rag_agent.ingest local/data
+python -m core.scripts.check
+python -m core.ingest local/data
 ```
 
 Embedding 模型变更后：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --force-embeddings
+python -m core.ingest local/data --force-embeddings
 ```
 
 摘要模型或摘要 prompt 变更后：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --force-summary --force-embeddings
+python -m core.ingest local/data --force-summary --force-embeddings
 ```
 
 怀疑索引损坏时：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --force-rebuild
+python -m core.ingest local/data --force-rebuild
 ```
 

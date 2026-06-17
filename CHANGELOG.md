@@ -13,7 +13,7 @@
 
 ### 摄入性能优化
 
-- 优化 `python -m wechat_rag_agent.ingest data` 的增量摄入流程：冷启动全量导入从 485.1s 降至 6.4s（76x），重新导出后的增量导入从 451.4s 降至 9.5s（47x），向已有库追加新聊天从 81.7s 降至 6.7s（12x）。
+- 优化 `python -m core.ingest data` 的增量摄入流程：冷启动全量导入从 485.1s 降至 6.4s（76x），重新导出后的增量导入从 451.4s 降至 9.5s（47x），向已有库追加新聊天从 81.7s 降至 6.7s（12x）。
 - 将 `recompute_message_sequence` 从全量关联子查询改为基于主键联接的 `UPDATE ... FROM`，并限定受影响线程、跳过未变化记录，12.3 万条消息的 seq 重算从约 477s 降至约 1s。
 - 增量导入只重建有新消息的线程；`sessions` 新增 `text_hash`，内容未变化的会话块会复用既有摘要和向量，避免全库重新分块、重新摘要、重新 embedding。
 - 新增自愈逻辑：每次运行自动补齐缺失的 FTS 索引、seq、摘要和向量；中断或部分失败后再次运行即可续传。
@@ -34,7 +34,7 @@
 - 日常重新导入直接运行：
 
 ```bash
-python -m wechat_rag_agent.ingest data
+python -m core.ingest data
 ```
 
 - 不再需要默认使用 `--force-rebuild`；已有摘要和向量会自动复用，缺失部分会自动补齐。

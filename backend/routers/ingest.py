@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from wechat_rag_agent.ingest import main as ingest_main
+from core.ingest import main as ingest_main
 
 
 router = APIRouter(prefix="/api/ingest", tags=["ingest"])

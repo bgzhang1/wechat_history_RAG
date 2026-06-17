@@ -612,7 +612,7 @@ def main() -> None:
 
     if not to_summarize and not to_embed_set:
         record_pending_files(pending_file_records)
-        print("\n无需生成摘要或向量。现在可以运行 python -m wechat_rag_agent.cli")
+        print("\n无需生成摘要或向量。现在可以运行 python -m core.cli")
         return
 
     batch_size = args.embed_batch_size
@@ -845,9 +845,9 @@ def main() -> None:
     if embed_fail_sessions:
         print(f"\n[警告] {embed_fail_sessions} 块向量生成失败；消息库与其余索引已保留，重跑 ingest 将只补建缺失部分。")
     if to_embed_set:
-        print(f"\n向量索引完成（本次写入 {embedded} 块，失败 {embed_fail_sessions} 块）。现在可以运行 python -m wechat_rag_agent.cli")
+        print(f"\n向量索引完成（本次写入 {embedded} 块，失败 {embed_fail_sessions} 块）。现在可以运行 python -m core.cli")
     else:
-        print("\n索引更新完成。现在可以运行 python -m wechat_rag_agent.cli")
+        print("\n索引更新完成。现在可以运行 python -m core.cli")
 
 
 if __name__ == "__main__":

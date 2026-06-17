@@ -9,9 +9,9 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
-import wechat_rag_agent.agent as agent_module
-from wechat_rag_agent.llm import chat_model
-from wechat_rag_agent.tools import TOOLS
+import core.agent as agent_module
+from core.llm import chat_model
+from core.tools import TOOLS
 
 
 _abort_flags: dict[str, bool] = {}

@@ -18,7 +18,7 @@ def main() -> None:
 
     db_path = Path(store.DB_PATH)
     if not db_path.exists():
-        raise SystemExit(f"找不到数据库 {db_path}。请先运行: python -m wechat_rag_agent.ingest local/data")
+        raise SystemExit(f"找不到数据库 {db_path}。请先运行: python -m core.ingest local/data")
 
     store.db()
     stats = store.stats()

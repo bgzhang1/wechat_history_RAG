@@ -19,7 +19,7 @@
 
 ```text
 wechat_agent/
-  wechat_rag_agent/      # 核心 Python 库（Agent、检索、导入、数据层）
+  core/      # 核心 Python 库（Agent、检索、导入、数据层）
   backend/               # FastAPI 后端（SSE 对话、设置、导入、统计）
   docs/                  # 技术文档
   runtime/               # 本地 SQLite 数据库，Git 忽略
@@ -40,8 +40,8 @@ pip install -r requirements.txt
 copy .env.example .env
 # 编辑 .env，至少填写 CHAT_BASE_URL / CHAT_API_KEY / CHAT_MODEL
 
-python -m wechat_rag_agent.scripts.check
-python -m wechat_rag_agent.ingest local/data
+python -m core.scripts.check
+python -m core.ingest local/data
 ```
 
 ### 启动 Web 后端
@@ -55,7 +55,7 @@ python -m uvicorn backend.main:app --reload
 ### 启动命令行交互
 
 ```bash
-python -m wechat_rag_agent.cli
+python -m core.cli
 ```
 
 ## 常用命令
@@ -63,35 +63,35 @@ python -m wechat_rag_agent.cli
 检查模型端点：
 
 ```bash
-python -m wechat_rag_agent.scripts.check
+python -m core.scripts.check
 ```
 
 导入目录或单个 JSON：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data
-python -m wechat_rag_agent.ingest path\to\chat.json
+python -m core.ingest local/data
+python -m core.ingest path\to\chat.json
 ```
 
 跳过摘要：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --no-summary
+python -m core.ingest local/data --no-summary
 ```
 
 强制重建部分索引：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --force-fts
-python -m wechat_rag_agent.ingest local/data --force-chunks
-python -m wechat_rag_agent.ingest local/data --force-summary
-python -m wechat_rag_agent.ingest local/data --force-embeddings
+python -m core.ingest local/data --force-fts
+python -m core.ingest local/data --force-chunks
+python -m core.ingest local/data --force-summary
+python -m core.ingest local/data --force-embeddings
 ```
 
 全量重建：
 
 ```bash
-python -m wechat_rag_agent.ingest local/data --force-rebuild
+python -m core.ingest local/data --force-rebuild
 ```
 
 ## 配置说明
@@ -124,11 +124,11 @@ SUMMARY_MODEL=your-chat-model
 ## 开发验证
 
 ```bash
-python -m compileall -q wechat_rag_agent backend
+python -m compileall -q core backend
 ```
 
 如果已有本地数据库，也可以运行：
 
 ```bash
-python -m wechat_rag_agent.scripts.smoke
+python -m core.scripts.smoke
 ```

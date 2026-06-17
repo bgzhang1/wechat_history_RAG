@@ -11,8 +11,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from wechat_rag_agent import store
-from wechat_rag_agent.llm import chat_configured, embed_configured
+from core import store
+from core.llm import chat_configured, embed_configured
 
 from .routers import chat, settings, stats
 
@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(
     title="微信聊天记录检索 API",
-    description="基于 wechat_rag_agent 的流式对话后端。",
+    description="基于 core 的流式对话后端。",
     version="0.1.0",
     lifespan=lifespan,
 )
