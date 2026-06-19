@@ -20,6 +20,7 @@ data/
 # Python caches and virtual environments
 __pycache__/
 *.py[cod]
+tests/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
