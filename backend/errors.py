@@ -10,28 +10,29 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .logging_utils import get_logger
+from .redaction import redact_data, redact_text
 
 logger = get_logger()
 
 
 def _default_action(status_code: int) -> str:
     if status_code == 400:
-        return "Check the request and try again."
+        return "请检查请求内容后重试。"
     if status_code == 401:
-        return "Sign in or refresh credentials."
+        return "请重新登录或刷新凭据。"
     if status_code == 403:
-        return "Use an account with permission for this action."
+        return "请使用有权限的账号执行此操作。"
     if status_code == 404:
-        return "Refresh the page or select another item."
+        return "请刷新页面或选择其他项目。"
     if status_code == 409:
-        return "Wait for the current operation to finish, then retry."
+        return "请等待当前操作结束后重试。"
     if status_code == 413:
-        return "Upload a smaller file."
+        return "请上传更小的文件。"
     if status_code == 422:
-        return "Fix the highlighted fields and try again."
+        return "请修正字段后重试。"
     if status_code == 503:
-        return "Check service configuration or retry later."
-    return "Retry later or check backend logs."
+        return "请检查服务配置，或稍后重试。"
+    return "请稍后重试，或查看后端日志。"
 
 
 def error_payload(
@@ -45,33 +46,50 @@ def error_payload(
     details: Any = None,
     path: str | None = None,
 ) -> dict[str, Any]:
+    safe_action = redact_text(action) if action else _default_action(status_code)
     payload: dict[str, Any] = {
         "error": {
             "code": code,
             "type": error_type,
-            "message": message,
+            "message": redact_text(message),
             "recoverable": recoverable,
-            "action": action or _default_action(status_code),
+            "action": safe_action,
         }
     }
     if details is not None:
-        payload["error"]["details"] = details
+        payload["error"]["details"] = redact_data(details)
     if path is not None:
         payload["error"]["path"] = path
     return payload
+
+
+def _public_validation_details(errors: list[dict[str, Any]]) -> Any:
+    public = redact_data(errors)
+    if not isinstance(public, list):
+        return public
+    sanitized: list[Any] = []
+    for item in public:
+        if isinstance(item, dict):
+            cleaned = dict(item)
+            if "input" in cleaned:
+                cleaned["input"] = "[omitted]"
+            sanitized.append(cleaned)
+        else:
+            sanitized.append(item)
+    return sanitized
 
 
 async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     detail = exc.detail
     if isinstance(detail, dict):
         code = str(detail.get("code") or f"HTTP_{exc.status_code}")
-        message = str(detail.get("message") or detail.get("detail") or "Request failed.")
+        message = redact_text(detail.get("message") or detail.get("detail") or "请求失败。")
         recoverable = bool(detail.get("recoverable", exc.status_code < 500))
         action = detail.get("action")
-        details = detail.get("details")
+        details = redact_data(detail.get("details")) if detail.get("details") is not None else None
     else:
         code = f"HTTP_{exc.status_code}"
-        message = str(detail)
+        message = redact_text(detail)
         recoverable = exc.status_code < 500 or exc.status_code == 503
         action = None
         details = None
@@ -104,19 +122,20 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
 
 
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    public_details = _public_validation_details(exc.errors())
     logger.info(
         "Request validation failed",
-        extra={"path": request.url.path, "status_code": 422, "details": exc.errors()},
+        extra={"path": request.url.path, "status_code": 422, "details": public_details},
     )
     return JSONResponse(
         status_code=422,
         content=error_payload(
             status_code=422,
             code="VALIDATION_ERROR",
-            message="Request validation failed.",
+            message="请求字段校验失败。",
             error_type="validation_error",
             recoverable=True,
-            details=exc.errors(),
+            details=public_details,
             path=request.url.path,
         ),
     )
@@ -133,7 +152,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
         content=error_payload(
             status_code=500,
             code="INTERNAL_ERROR",
-            message=f"{type(exc).__name__}: {exc}",
+            message="后端服务发生内部错误，请查看错误日志获取详情。",
             error_type="internal_error",
             recoverable=False,
             path=request.url.path,

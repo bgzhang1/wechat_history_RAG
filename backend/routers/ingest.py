@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -11,12 +12,18 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Body, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from core import store
+from core.llm import chat_config_status, embed_configured
+from core.parser import PARSER_VERSION, file_scope_for_path, is_weflow_export, stable_upload_scope
 
 from ..logging_utils import get_logger
+from ..redaction import public_exception_message, redact_text
+from .params import query_int
 
 
 router = APIRouter(prefix="/api/ingest", tags=["ingest"])
@@ -26,11 +33,42 @@ logger = get_logger()
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOCAL_ROOT = PROJECT_ROOT / "local"
 UPLOAD_ROOT = LOCAL_ROOT / "uploads"
-MAX_UPLOAD_BYTES = int(os.getenv("INGEST_MAX_UPLOAD_MB", "512")) * 1024 * 1024
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+MAX_UPLOAD_BYTES = _env_int("INGEST_MAX_UPLOAD_MB", 512) * 1024 * 1024
+MAX_TASKS = _env_int("INGEST_MAX_TASKS", 100)
+MAX_TASK_LOG_LINES = _env_int("INGEST_MAX_TASK_LOG_LINES", 5000)
+MAX_TASK_LOG_LINE_CHARS = _env_int("INGEST_MAX_TASK_LOG_LINE_CHARS", 4000)
+TASK_LOG_VIEW_CHARS = 30000
+TASK_LOG_TAIL_CHARS = 2000
+TASK_PROGRESS_LOG_CHARS = 20000
+MAX_INGEST_TARGET_CHARS = 2048
+PROGRESS_PREFIX = "__INGEST_PROGRESS__ "
 
 _tasks: dict[str, dict[str, Any]] = {}
 _tasks_lock = threading.RLock()
 _process_lock = threading.Lock()
+IngestMode = Literal["incremental", "full", "rebuild", "fts", "chunks", "summary", "embeddings", "vector"]
+INDEX_ONLY_MODES = {"fts", "chunks", "summary", "embeddings", "vector"}
+SESSION_CHUNK_REQUIRED_MODES = {"summary", "embeddings", "vector"}
+INGEST_MODE_ARGS: dict[str, list[str]] = {
+    "incremental": [],
+    "full": ["--force-import"],
+    "rebuild": ["--force-rebuild"],
+    "fts": ["--skip-import", "--force-fts"],
+    "chunks": ["--skip-import", "--force-chunks"],
+    "summary": ["--skip-import", "--force-summary"],
+    "embeddings": ["--skip-import", "--force-embeddings"],
+    "vector": ["--skip-import", "--force-embeddings"],
+}
 
 
 class UploadResponse(BaseModel):
@@ -47,12 +85,52 @@ class LocalFileItem(BaseModel):
     modified_at: str
     source: str
     upload_id: str | None = None
+    ingest_status: str = "never"
+    ingest_status_reason: str | None = None
+    last_ingested_at: str | None = None
+    ingest_total: int | None = None
+    ingest_included: int | None = None
+    ingest_changed: int | None = None
+    ingest_inserted: int | None = None
+    session_chunks: int | None = None
+    missing_summary_chunks: int | None = None
+    missing_vector_chunks: int | None = None
+    task_id: str | None = None
+    task_status: str | None = None
+    task_mode: str | None = None
 
 
 class IngestStartRequest(BaseModel):
-    upload_id: str | None = Field(default=None, description="ID returned by /api/ingest/upload")
-    file_id: str | None = Field(default=None, description="Relative file ID returned by /api/ingest/files")
-    file_path: str | None = Field(default=None, description="Legacy local path under local/")
+    upload_id: str | None = Field(
+        default=None,
+        max_length=MAX_INGEST_TARGET_CHARS,
+        description="ID returned by /api/ingest/upload",
+    )
+    file_id: str | None = Field(
+        default=None,
+        max_length=MAX_INGEST_TARGET_CHARS,
+        description="Relative file ID returned by /api/ingest/files",
+    )
+    file_path: str | None = Field(
+        default=None,
+        max_length=MAX_INGEST_TARGET_CHARS,
+        description="Legacy local path under local/",
+    )
+    mode: IngestMode = Field(
+        default="incremental",
+        description="Ingest mode: incremental/full/rebuild/fts/chunks/summary/embeddings/vector",
+    )
+
+    @field_validator("upload_id", "file_id", "file_path", mode="before")
+    @classmethod
+    def normalize_target(cls, value: object) -> object:
+        return _normalize_target_value(value)
+
+
+def _normalize_target_value(value: object) -> object:
+    if value is None or not isinstance(value, str):
+        return value
+    return value.strip() or None
 
 
 class TaskStatus(BaseModel):
@@ -62,8 +140,14 @@ class TaskStatus(BaseModel):
     created_at: str
     updated_at: str
     file_id: str | None = None
+    mode: str = "incremental"
     error: str | None = None
     can_cancel: bool = False
+    progress: int = 0
+    stage: str = "starting"
+    message: str = ""
+    eta: int | None = None
+    log_tail: str = ""
 
 
 class TaskProgress(BaseModel):
@@ -71,16 +155,18 @@ class TaskProgress(BaseModel):
     status: str
     progress: int
     stage: str
+    message: str = ""
     eta: int | None = None
     updated_at: str
     file_id: str | None = None
+    mode: str = "incremental"
     error: str | None = None
     can_cancel: bool = False
     log_tail: str = ""
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _timestamp(ts: float) -> str:
@@ -96,14 +182,58 @@ def _task_update(task_id: str, **fields: Any) -> None:
         task["updated_at"] = _now()
 
 
+def _task_log_prefix(task: dict[str, Any], limit: int) -> str:
+    lines = task.get("logs", [])
+    parts: list[str] = []
+    total = 0
+    for line in lines:
+        text = str(line)
+        remaining = limit - total
+        if remaining <= 0:
+            break
+        if len(text) > remaining:
+            parts.append(text[:remaining])
+            break
+        parts.append(text)
+        total += len(text)
+    return "".join(parts)
+
+
+def _task_log_tail(task: dict[str, Any], limit: int) -> str:
+    lines = task.get("logs", [])
+    parts: list[str] = []
+    total = 0
+    for line in reversed(lines):
+        text = str(line)
+        remaining = limit - total
+        if remaining <= 0:
+            break
+        if len(text) > remaining:
+            parts.append(text[-remaining:])
+            break
+        parts.append(text)
+        total += len(text)
+    return "".join(reversed(parts))
+
+
 def _task_snapshot(task_id: str, include_logs: bool = True) -> TaskStatus:
     with _tasks_lock:
         task = _tasks.get(task_id)
         if task is None:
-            raise HTTPException(status_code=404, detail="Task not found.")
+            raise HTTPException(status_code=404, detail="导入任务不存在。")
 
-        logs = "".join(task.get("logs", [])) if include_logs else ""
         status = task["status"]
+        progress_logs = _task_log_tail(task, TASK_PROGRESS_LOG_CHARS)
+        progress, stage = _task_progress_state(task, progress_logs, status)
+        logs = (
+            redact_text(
+                _task_log_prefix(task, TASK_LOG_VIEW_CHARS),
+                limit=TASK_LOG_VIEW_CHARS,
+                collapse_whitespace=False,
+            )
+            if include_logs
+            else ""
+        )
         return TaskStatus(
             task_id=task_id,
             status=status,
@@ -111,8 +241,22 @@ def _task_snapshot(task_id: str, include_logs: bool = True) -> TaskStatus:
             created_at=task["created_at"],
             updated_at=task["updated_at"],
             file_id=task.get("file_id"),
-            error=task.get("error"),
+            mode=str(task.get("mode") or "incremental"),
+            error=_task_public_error(task),
             can_cancel=status in {"running", "cancel_requested"},
+            progress=progress,
+            stage=stage,
+            message=_task_progress_message(task),
+            eta=_task_eta(task["created_at"], status, progress),
+            log_tail=(
+                redact_text(
+                    _task_log_tail(task, TASK_LOG_TAIL_CHARS),
+                    limit=TASK_LOG_TAIL_CHARS,
+                    collapse_whitespace=False,
+                )
+                if include_logs
+                else ""
+            ),
         )
 
 
@@ -162,6 +306,100 @@ def _parse_progress_from_logs(logs: str, status: str) -> tuple[int, str]:
     return min(progress, 99 if status in {"running", "cancel_requested"} else 100), stage
 
 
+def _task_progress_state(task: dict[str, Any], logs: str, status: str) -> tuple[int, str]:
+    event = task.get("progress_event")
+    if isinstance(event, dict):
+        progress = _clamp_progress(event.get("progress", 0))
+        stage = str(event.get("stage") or status or "starting")
+        if status == "completed":
+            return 100, "completed"
+        if status == "cancelled":
+            return progress, "cancelled"
+        if status == "error":
+            return progress, "error"
+        if status == "cancel_requested":
+            return min(progress, 99), "cancelling"
+        return min(progress, 99), stage
+    return _parse_progress_from_logs(logs, status)
+
+
+def _task_progress_message(task: dict[str, Any]) -> str:
+    event = task.get("progress_event")
+    if not isinstance(event, dict):
+        return ""
+    return str(event.get("message") or "")
+
+
+def _task_public_error(task: dict[str, Any]) -> str | None:
+    error = task.get("error")
+    if error is None:
+        return None
+    return redact_text(error, limit=500)
+
+
+def _task_failure_error(task_id: str, return_code: int) -> str:
+    fallback = f"ingest exited with code {return_code}"
+    detail = _task_failure_detail(task_id)
+    return f"{fallback}: {detail}" if detail else fallback
+
+
+def _task_failure_detail(task_id: str) -> str:
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            return ""
+
+        progress_message = _failure_progress_message(task.get("progress_event"))
+        if progress_message:
+            return progress_message
+
+        log_tail = _task_log_tail(task, TASK_LOG_TAIL_CHARS)
+
+    for raw_line in reversed(log_tail.splitlines()):
+        line = raw_line.strip()
+        if not line or line.startswith(PROGRESS_PREFIX) or line == "...[line truncated]":
+            continue
+        detail = redact_text(line, limit=500)
+        if detail:
+            return detail
+    return ""
+
+
+def _failure_progress_message(event: Any) -> str:
+    if not isinstance(event, dict):
+        return ""
+    if str(event.get("stage") or "").strip().lower() != "error":
+        return ""
+    return redact_text(event.get("message") or "", limit=500)
+
+
+def _clamp_progress(value: Any) -> int:
+    try:
+        progress = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(progress, 100))
+
+
+def _parse_progress_event(text: str) -> dict[str, Any] | None:
+    if not text.startswith(PROGRESS_PREFIX):
+        return None
+    try:
+        payload = json.loads(text[len(PROGRESS_PREFIX) :])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    stage = str(payload.get("stage") or "").strip()
+    if not stage:
+        return None
+    return {
+        "stage": stage[:80],
+        "progress": _clamp_progress(payload.get("progress", 0)),
+        "message": redact_text(payload.get("message") or "", limit=500),
+    }
+
+
 def _estimate_eta(created_at: str, progress: int) -> int | None:
     if progress <= 0 or progress >= 100:
         return None
@@ -173,50 +411,148 @@ def _estimate_eta(created_at: str, progress: int) -> int | None:
     return int(elapsed * (100 - progress) / progress)
 
 
+def _task_eta(created_at: str, status: str, progress: int) -> int | None:
+    if status in {"completed", "cancelled", "error"}:
+        return None
+    return _estimate_eta(created_at, progress)
+
+
 def _task_progress(task_id: str) -> TaskProgress:
     with _tasks_lock:
         task = _tasks.get(task_id)
         if task is None:
-            raise HTTPException(status_code=404, detail="Task not found.")
-        logs = "".join(task.get("logs", []))
+            raise HTTPException(status_code=404, detail="导入任务不存在。")
+        logs = _task_log_tail(task, TASK_PROGRESS_LOG_CHARS)
         status = task["status"]
-        progress, stage = _parse_progress_from_logs(logs, status)
-        log_tail = logs[-2000:]
+        progress, stage = _task_progress_state(task, logs, status)
+        log_tail = redact_text(_task_log_tail(task, TASK_LOG_TAIL_CHARS), limit=TASK_LOG_TAIL_CHARS, collapse_whitespace=False)
         return TaskProgress(
             task_id=task_id,
             status=status,
             progress=progress,
             stage=stage,
-            eta=_estimate_eta(task["created_at"], progress),
+            message=_task_progress_message(task),
+            eta=_task_eta(task["created_at"], status, progress),
             updated_at=task["updated_at"],
             file_id=task.get("file_id"),
-            error=task.get("error"),
+            mode=str(task.get("mode") or "incremental"),
+            error=_task_public_error(task),
             can_cancel=status in {"running", "cancel_requested"},
             log_tail=log_tail,
         )
 
 
-def _has_running_task() -> bool:
+def _create_task_or_raise(resolved_path: Path, mode: str) -> str:
+    task_id = str(uuid.uuid4())
+    now = _now()
     with _tasks_lock:
-        return any(task.get("status") in {"running", "cancel_requested"} for task in _tasks.values())
+        if any(task.get("status") in {"running", "cancel_requested"} for task in _tasks.values()):
+            raise HTTPException(status_code=409, detail="已有导入任务正在运行，请等待完成或取消后再试。")
+        if _process_lock.locked():
+            raise HTTPException(status_code=409, detail="上一个导入任务正在收尾，请稍后再试。")
+        _tasks[task_id] = {
+            "status": "running",
+            "logs": [],
+            "created_at": now,
+            "updated_at": now,
+            "error": None,
+            "file_id": _file_id_for(resolved_path),
+            "mode": mode,
+            "process": None,
+        }
+    _prune_tasks()
+    return task_id
+
+
+def _prune_tasks() -> None:
+    with _tasks_lock:
+        if len(_tasks) <= MAX_TASKS:
+            return
+        finished = [
+            (task_id, task)
+            for task_id, task in _tasks.items()
+            if task.get("status") not in {"running", "cancel_requested"}
+        ]
+        finished.sort(key=lambda item: str(item[1].get("updated_at", "")))
+        for task_id, _task in finished[: max(0, len(_tasks) - MAX_TASKS)]:
+            _tasks.pop(task_id, None)
+
+
+def _task_sort_key(task_id: str) -> tuple[int, str, str]:
+    task = _tasks[task_id]
+    live_rank = 1 if task.get("status") in {"running", "cancel_requested"} else 0
+    return live_rank, str(task.get("updated_at", "")), str(task.get("created_at", ""))
 
 
 def _safe_upload_id(upload_id: str) -> str:
     try:
         return str(uuid.UUID(upload_id))
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid upload_id.") from exc
+        raise HTTPException(status_code=400, detail="upload_id 无效。") from exc
 
 
 def _file_id_for(path: Path) -> str:
     return path.resolve().relative_to(LOCAL_ROOT.resolve()).as_posix()
 
 
+def _upload_meta_path(upload_path: Path) -> Path:
+    return upload_path.with_suffix(upload_path.suffix + ".meta")
+
+
+def _clean_display_filename(filename: str) -> str:
+    cleaned = " ".join(Path(filename or "upload.json").name.split())
+    if not cleaned:
+        cleaned = "upload.json"
+    if len(cleaned) <= 240:
+        return cleaned
+
+    path = Path(cleaned)
+    suffix = path.suffix
+    if not suffix:
+        return cleaned[:240]
+
+    max_stem_length = max(1, 240 - len(suffix))
+    stem = path.stem[:max_stem_length].rstrip() or "upload"
+    return f"{stem}{suffix}"
+
+
+def _write_upload_meta(upload_path: Path, filename: str, scope: str | None = None) -> None:
+    meta = {"filename": _clean_display_filename(filename)}
+    if scope:
+        meta["scope"] = scope
+    _upload_meta_path(upload_path).write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_json_file(path: Path) -> Any:
+    with path.open("rb") as probe:
+        encoding = json.detect_encoding(probe.read(4))
+    with path.open("r", encoding=encoding) as source:
+        return json.load(source)
+
+
+def _upload_display_name(upload_path: Path) -> str:
+    meta_path = _upload_meta_path(upload_path)
+    if not meta_path.exists():
+        return upload_path.name
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return upload_path.name
+    filename = _clean_display_filename(str(meta.get("filename") or ""))
+    return filename or upload_path.name
+
+
 def _resolve_upload(upload_id: str) -> Path:
     safe_id = _safe_upload_id(upload_id)
-    path = (UPLOAD_ROOT / f"{safe_id}.json").resolve()
+    try:
+        path = (UPLOAD_ROOT / f"{safe_id}.json").resolve()
+        path.relative_to(LOCAL_ROOT.resolve())
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="upload_id 指向的上传文件无效。") from exc
     if not path.exists():
-        raise HTTPException(status_code=404, detail="Uploaded file not found.")
+        raise HTTPException(status_code=404, detail="上传文件不存在。")
+    if not path.is_file():
+        raise HTTPException(status_code=400, detail="upload_id 必须指向 .json 文件。")
     return path
 
 
@@ -225,12 +561,14 @@ def _resolve_local_file_id(file_id: str) -> Path:
         path = (LOCAL_ROOT / file_id).resolve()
         path.relative_to(LOCAL_ROOT.resolve())
     except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid file_id.") from exc
+        raise HTTPException(status_code=400, detail="file_id 无效。") from exc
 
     if not path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
+        raise HTTPException(status_code=404, detail="文件不存在。")
+    if not path.is_file():
+        raise HTTPException(status_code=400, detail="file_id 必须指向 .json 文件。")
     if path.suffix.lower() != ".json":
-        raise HTTPException(status_code=400, detail="Only .json files can be ingested.")
+        raise HTTPException(status_code=400, detail="只能导入 .json 文件。")
     return path
 
 
@@ -241,38 +579,222 @@ def _resolve_local_path(file_path: str) -> Path:
         path = candidate.resolve()
         path.relative_to(LOCAL_ROOT.resolve())
     except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="file_path must be under the project local/ directory.") from exc
+        raise HTTPException(status_code=400, detail="file_path 必须位于项目 local/ 目录下。") from exc
 
     if not path.exists():
-        raise HTTPException(status_code=404, detail="Specified file_path does not exist.")
-    if path.suffix.lower() != ".json":
-        raise HTTPException(status_code=400, detail="Only .json files can be ingested.")
+        raise HTTPException(status_code=404, detail="指定的 file_path 不存在。")
+    if not path.is_dir() and path.suffix.lower() != ".json":
+        raise HTTPException(status_code=400, detail="只能导入 .json 文件或 local/ 下的目录。")
     return path
 
 
+def _directory_json_targets(path: Path) -> list[Path]:
+    if not path.is_dir():
+        return [path] if path.is_file() and path.suffix.lower() == ".json" else []
+    try:
+        root = path.resolve()
+        local_root = LOCAL_ROOT.resolve()
+        targets: list[Path] = []
+        candidates = path.rglob("*")
+        for candidate in candidates:
+            try:
+                if not candidate.is_file() or candidate.suffix.lower() != ".json":
+                    continue
+                resolved = candidate.resolve()
+                resolved.relative_to(root)
+                resolved.relative_to(local_root)
+                targets.append(resolved)
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return []
+    return sorted(dict.fromkeys(targets), key=lambda item: item.as_posix().lower())
+
+
+def _index_scope_for_paths(paths: list[Path]) -> tuple[list[str], list[int]]:
+    file_keys = [_file_record_key(path) for path in paths]
+    prefixes = [f"{file_scope_for_path(path)}:" for path in paths]
+    threads = {
+        *store.get_threads_for_ingest_file_paths(file_keys),
+        *store.get_threads_for_message_id_prefixes(prefixes),
+    }
+    session_ids = {
+        *store.get_session_ids_for_ingest_file_paths(file_keys),
+        *store.get_session_ids_for_message_id_prefixes(prefixes),
+    }
+    return sorted(threads), sorted(session_ids)
+
+
+def _validate_directory_index_scope(paths: list[Path], mode: str) -> None:
+    threads, session_ids = _index_scope_for_paths(paths)
+    if mode in SESSION_CHUNK_REQUIRED_MODES:
+        index_status = store.get_session_index_status(session_ids)
+        total_chunks = index_status.get("total")
+        if not isinstance(total_chunks, int) or total_chunks <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="仅摘要或仅向量构建要求目标目录已有会话分块；请先执行仅分块、全流程导入或强制重建。",
+            )
+        return
+    if not threads:
+        raise HTTPException(
+            status_code=400,
+            detail="目录单项索引构建要求至少一个 JSON 已有可定位的入库消息范围；请先执行增量导入、全流程导入或强制重建。",
+        )
+
+
+def _mode_args(mode: str) -> list[str]:
+    return INGEST_MODE_ARGS.get(mode, [])
+
+
+def _summary_available() -> bool:
+    summary_model = (os.getenv("SUMMARY_MODEL") or "").strip()
+    if not summary_model:
+        return False
+    try:
+        return bool(chat_config_status(summary_model).get("configured"))
+    except Exception:
+        return False
+
+
+def _embedding_available() -> bool:
+    try:
+        return bool(embed_configured() and store.has_vec())
+    except Exception:
+        return False
+
+
+def _public_index_status(
+    index_status: dict[str, int | None],
+    *,
+    summary_available: bool,
+    embedding_available: bool,
+) -> dict[str, int | None]:
+    return {
+        "total": index_status["total"],
+        "missing_summary": index_status["missing_summary"] if summary_available else None,
+        "missing_embedding": index_status["missing_embedding"] if embedding_available else None,
+    }
+
+
+def _start_message(mode: str, resolved_path: Path) -> str:
+    target_label = "目标目录" if resolved_path.is_dir() else "该 JSON"
+    message_scope_label = "目标目录关联消息" if resolved_path.is_dir() else "该 JSON 关联消息"
+    messages = {
+        "incremental": f"增量导入任务已启动：将检查{target_label}，按需解析并补齐缺失索引。",
+        "full": f"全流程导入任务已启动：将重新解析{target_label}，并补齐必要索引、摘要和向量。",
+        "rebuild": f"强制重建任务已启动：将重新解析{target_label}，并重建其关联索引、会话分块、摘要和向量。",
+        "fts": f"仅 FTS 任务已启动：将重建{message_scope_label}的全文索引，不会调用模型或 embedding。",
+        "chunks": f"仅分块任务已启动：将重建{target_label}关联会话的会话块。",
+        "summary": f"仅摘要任务已启动：将处理{target_label}已入库会话块，可能调用摘要模型。",
+        "embeddings": f"仅向量任务已启动：将处理{target_label}已入库会话块，可能调用 embedding API。",
+        "vector": f"仅向量任务已启动：将处理{target_label}已入库会话块，可能调用 embedding API。",
+    }
+    return messages.get(mode, "导入任务已启动。")
+
+
+def _latest_task_for_file(file_id: str) -> tuple[str, dict[str, Any]] | None:
+    with _tasks_lock:
+        matching = [
+            (task_id, task)
+            for task_id, task in _tasks.items()
+            if task.get("file_id") == file_id
+        ]
+        if not matching:
+            return None
+        return max(
+            matching,
+            key=lambda item: (
+                str(item[1].get("created_at", "")),
+                str(item[1].get("updated_at", "")),
+                item[0],
+            ),
+        )
+
+
+def _file_ingest_status(stat: os.stat_result, record: dict[str, Any] | None, latest_task: dict[str, Any] | None) -> str:
+    task_status = str(latest_task.get("status")) if latest_task else ""
+    if task_status in {"running", "cancel_requested"}:
+        return task_status
+    if record is None:
+        return "never"
+    if (
+        int(record["size"]) == stat.st_size
+        and int(record["mtime_ns"]) == stat.st_mtime_ns
+        and int(record.get("parser_version") or 0) >= PARSER_VERSION
+    ):
+        return "up_to_date"
+    return "changed"
+
+
+def _file_ingest_status_reason(stat: os.stat_result, record: dict[str, Any] | None, latest_task: dict[str, Any] | None) -> str | None:
+    task_status = str(latest_task.get("status")) if latest_task else ""
+    if task_status in {"running", "cancel_requested"} or record is None:
+        return None
+    file_current = int(record["size"]) == stat.st_size and int(record["mtime_ns"]) == stat.st_mtime_ns
+    parser_current = int(record.get("parser_version") or 0) >= PARSER_VERSION
+    if not file_current:
+        return "file_changed"
+    if not parser_current:
+        return "parser_version_stale"
+    return None
+
+
+def _is_file_record_current(path: Path) -> bool:
+    stat = path.stat()
+    file_key = str(path.resolve())
+    record = store.get_ingest_file_records([file_key]).get(file_key)
+    return bool(
+        record
+        and int(record["size"]) == stat.st_size
+        and int(record["mtime_ns"]) == stat.st_mtime_ns
+        and int(record.get("parser_version") or 0) >= PARSER_VERSION
+    )
+
+
+def _has_file_index_scope(path: Path) -> bool:
+    file_key = _file_record_key(path)
+    if store.ingest_file_message_mapping_exists(file_key):
+        return True
+    prefix = f"{file_scope_for_path(path)}:"
+    return bool(store.get_threads_for_message_id_prefixes([prefix]))
+
+
 def _append_log(task_id: str, text: str) -> None:
+    progress_event = _parse_progress_event(text.strip())
+    if len(text) > MAX_TASK_LOG_LINE_CHARS:
+        text = text[:MAX_TASK_LOG_LINE_CHARS] + "\n...[line truncated]\n"
     with _tasks_lock:
         task = _tasks.get(task_id)
         if task is None:
             return
+        if progress_event is not None:
+            task["progress_event"] = progress_event
+            task["updated_at"] = _now()
+            return
         task.setdefault("logs", []).append(text)
-        if len(task["logs"]) > 5000:
-            task["logs"] = task["logs"][-5000:]
+        if len(task["logs"]) > MAX_TASK_LOG_LINES:
+            task["logs"] = task["logs"][-MAX_TASK_LOG_LINES:]
         task["updated_at"] = _now()
 
 
 def _requested_cancel(task_id: str) -> bool:
     with _tasks_lock:
         task = _tasks.get(task_id)
-        return bool(task and task.get("status") == "cancel_requested")
+        return bool(task and task.get("status") in {"cancel_requested", "cancelled"})
 
 
-def _run_ingest_task(task_id: str, file_path: Path) -> None:
+def _run_ingest_task(task_id: str, file_path: Path, mode: str) -> None:
+    if _requested_cancel(task_id):
+        _task_update(task_id, status="cancelled", error=None)
+        logger.info("Ingest task cancelled before worker acquired process lock", extra={"task_id": task_id})
+        return
+
     if not _process_lock.acquire(blocking=False):
-        _task_update(task_id, status="error", error="Another ingest task is already running.")
+        _task_update(task_id, status="error", error="已有导入任务正在运行。")
         logger.error(
             "Failed to start ingest task because another task is running",
-            extra={"task_id": task_id, "file_id": _file_id_for(file_path)},
+            extra={"task_id": task_id, "file_id": _file_id_for(file_path), "mode": mode},
         )
         return
 
@@ -283,9 +805,13 @@ def _run_ingest_task(task_id: str, file_path: Path) -> None:
             logger.info("Ingest task cancelled before start", extra={"task_id": task_id})
             return
 
+        command = [sys.executable, "-m", "core.ingest", str(file_path), *_mode_args(mode)]
+        env = os.environ.copy()
+        env["INGEST_PROGRESS_JSON"] = "true"
         process = subprocess.Popen(
-            [sys.executable, "-m", "core.ingest", str(file_path)],
+            command,
             cwd=str(PROJECT_ROOT),
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -293,7 +819,15 @@ def _run_ingest_task(task_id: str, file_path: Path) -> None:
             errors="replace",
         )
         _task_update(task_id, process=process)
-        logger.info("Ingest subprocess started", extra={"task_id": task_id, "file_id": _file_id_for(file_path)})
+        if _requested_cancel(task_id):
+            _terminate_process(process)
+            _task_update(task_id, status="cancelled", error=None)
+            logger.info("Ingest task cancelled immediately after subprocess start", extra={"task_id": task_id})
+            return
+        logger.info(
+            "Ingest subprocess started",
+            extra={"task_id": task_id, "file_id": _file_id_for(file_path), "mode": mode},
+        )
 
         assert process.stdout is not None
         for line in process.stdout:
@@ -307,10 +841,10 @@ def _run_ingest_task(task_id: str, file_path: Path) -> None:
             _task_update(task_id, status="completed", error=None)
             logger.info("Ingest task completed", extra={"task_id": task_id})
         else:
-            _task_update(task_id, status="error", error=f"ingest exited with code {return_code}")
+            _task_update(task_id, status="error", error=_task_failure_error(task_id, return_code))
             logger.error("Ingest task failed", extra={"task_id": task_id, "return_code": return_code})
     except BaseException as exc:
-        _task_update(task_id, status="error", error=f"{type(exc).__name__}: {exc}")
+        _task_update(task_id, status="error", error=public_exception_message("Ingest task failed", exc))
         logger.error(
             "Ingest task crashed",
             exc_info=(type(exc), exc, exc.__traceback__),
@@ -322,70 +856,250 @@ def _run_ingest_task(task_id: str, file_path: Path) -> None:
         _process_lock.release()
 
 
+def _terminate_process(process: subprocess.Popen[str]) -> bool:
+    if process.poll() is not None:
+        return True
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+        return True
+    except subprocess.TimeoutExpired:
+        process.kill()
+    try:
+        process.wait(timeout=5)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("Ingest subprocess did not exit after kill", extra={"pid": process.pid})
+        return False
+
+
+def shutdown_running_tasks() -> None:
+    processes: list[tuple[str, subprocess.Popen[str]]] = []
+    task_ids_without_process: list[str] = []
+    with _tasks_lock:
+        for task_id, task in _tasks.items():
+            if task.get("status") not in {"running", "cancel_requested"}:
+                continue
+            task["status"] = "cancel_requested"
+            task["updated_at"] = _now()
+            process = task.get("process")
+            if process is not None:
+                processes.append((task_id, process))
+            else:
+                task_ids_without_process.append(task_id)
+
+    for task_id, process in processes:
+        _terminate_process(process)
+        _task_update(task_id, status="cancelled", error="后端关闭，导入任务已终止。", process=None)
+        logger.info("Ingest task cancelled during backend shutdown", extra={"task_id": task_id})
+    for task_id in task_ids_without_process:
+        _task_update(task_id, status="cancelled", error="后端关闭，导入任务已取消。", process=None)
+        logger.info("Queued ingest task cancelled during backend shutdown", extra={"task_id": task_id})
+
+
+def _json_file_snapshots() -> list[tuple[Path, os.stat_result, str]]:
+    snapshots: list[tuple[Path, os.stat_result, str]] = []
+    local_root = LOCAL_ROOT.resolve()
+    try:
+        candidates = LOCAL_ROOT.rglob("*")
+        for path in candidates:
+            try:
+                if not path.is_file() or path.suffix.lower() != ".json":
+                    continue
+                resolved = path.resolve()
+                resolved.relative_to(local_root)
+                stat = path.stat()
+                snapshots.append((path, stat, str(resolved)))
+            except ValueError:
+                logger.warning(
+                    "Skipped ingest file outside local root",
+                    extra={"file_id": path.name},
+                )
+                continue
+            except OSError as exc:
+                logger.warning(
+                    "Skipped unreadable ingest file during listing",
+                    extra={"file_id": _safe_file_id_for_log(path), "error": public_exception_message("文件状态读取失败", exc)},
+                )
+                continue
+    except OSError as exc:
+        logger.warning(
+            "Stopped ingest file listing after directory scan error",
+            extra={"error": public_exception_message("文件列表扫描失败", exc)},
+        )
+    return sorted(snapshots, key=lambda item: item[1].st_mtime, reverse=True)
+
+
+def _safe_file_id_for_log(path: Path) -> str:
+    try:
+        return _file_id_for(path)
+    except Exception:
+        return path.name
+
+
+def _file_record_key(path: Path) -> str:
+    return str(path.resolve())
+
+
+def _unknown_index_status() -> dict[str, int | None]:
+    return {"total": None, "missing_summary": None, "missing_embedding": None}
+
+
+def _index_status_for_file(path: Path) -> dict[str, int | None]:
+    return _index_statuses_for_files([path]).get(_file_record_key(path), _unknown_index_status())
+
+
+def _index_statuses_for_files(paths: list[Path]) -> dict[str, dict[str, int | None]]:
+    file_keys_by_path = {_file_record_key(path): path for path in paths}
+    if not file_keys_by_path:
+        return {}
+
+    file_keys = list(file_keys_by_path)
+    mapped_paths = store.get_ingest_file_message_mapping_paths(file_keys)
+    mapped_session_ids = store.get_session_ids_by_ingest_file_paths(file_keys)
+    session_ids_by_key: dict[str, list[int]] = {}
+    prefix_by_key: dict[str, str] = {}
+    mapped_empty_keys: set[str] = set()
+    statuses: dict[str, dict[str, int | None]] = {}
+
+    for file_key, path in file_keys_by_path.items():
+        if file_key in mapped_paths:
+            session_ids = mapped_session_ids.get(file_key, [])
+            if session_ids:
+                session_ids_by_key[file_key] = session_ids
+            else:
+                mapped_empty_keys.add(file_key)
+                prefix_by_key[file_key] = f"{file_scope_for_path(path)}:"
+        else:
+            prefix_by_key[file_key] = f"{file_scope_for_path(path)}:"
+
+    prefix_session_ids = store.get_session_ids_by_message_id_prefixes(list(prefix_by_key.values()))
+    for file_key, prefix in prefix_by_key.items():
+        session_ids = prefix_session_ids.get(prefix, [])
+        if session_ids:
+            session_ids_by_key[file_key] = session_ids
+        elif file_key in mapped_empty_keys:
+            session_ids_by_key[file_key] = []
+        else:
+            statuses[file_key] = _unknown_index_status()
+
+    statuses.update(store.get_session_index_statuses(session_ids_by_key))
+    return statuses
+
+
 @router.get("/files", summary="List local ingest files")
 def list_files(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     LOCAL_ROOT.mkdir(parents=True, exist_ok=True)
-    files = sorted(
-        (path for path in LOCAL_ROOT.rglob("*.json") if path.is_file()),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    page = files[offset : offset + limit]
+    safe_limit = query_int(limit, 100, minimum=1, maximum=500)
+    safe_offset = query_int(offset, 0, minimum=0)
+    files = _json_file_snapshots()
+    page = files[safe_offset : safe_offset + safe_limit]
+    records = store.get_ingest_file_records([resolved_key for _path, _stat, resolved_key in page])
+    indexed_paths = [path for path, _stat, resolved_key in page if resolved_key in records]
+    index_statuses = _index_statuses_for_files(indexed_paths)
+    summary_available = _summary_available()
+    embedding_available = _embedding_available()
     items: list[LocalFileItem] = []
-    for path in page:
-        stat = path.stat()
+    for path, stat, resolved_key in page:
         upload_id: str | None = None
         source = "local"
         if path.parent.resolve() == UPLOAD_ROOT.resolve():
             try:
                 upload_id = str(uuid.UUID(path.stem))
                 source = "upload"
+                filename = _upload_display_name(path)
             except ValueError:
-                pass
+                filename = path.name
+        else:
+            filename = path.name
+        file_id = _file_id_for(path)
+        latest = _latest_task_for_file(file_id)
+        latest_task_id = latest[0] if latest else None
+        latest_task = latest[1] if latest else None
+        record = records.get(resolved_key)
+        changed = record.get("changed", record.get("inserted")) if record else None
+        raw_index_status = index_statuses.get(resolved_key, _unknown_index_status()) if record else _unknown_index_status()
+        index_status = _public_index_status(
+            raw_index_status,
+            summary_available=summary_available,
+            embedding_available=embedding_available,
+        )
         items.append(
             LocalFileItem(
-                file_id=_file_id_for(path),
-                filename=path.name,
+                file_id=file_id,
+                filename=filename,
                 size=stat.st_size,
                 modified_at=_timestamp(stat.st_mtime),
                 source=source,
                 upload_id=upload_id,
+                ingest_status=_file_ingest_status(stat, record, latest_task),
+                ingest_status_reason=_file_ingest_status_reason(stat, record, latest_task),
+                last_ingested_at=record.get("updated_at") if record else None,
+                ingest_total=record.get("total") if record else None,
+                ingest_included=record.get("included") if record else None,
+                ingest_changed=changed,
+                ingest_inserted=record.get("inserted") if record else None,
+                session_chunks=index_status["total"],
+                missing_summary_chunks=index_status["missing_summary"],
+                missing_vector_chunks=index_status["missing_embedding"],
+                task_id=latest_task_id,
+                task_status=latest_task.get("status") if latest_task else None,
+                task_mode=latest_task.get("mode") if latest_task else None,
             )
         )
-    return {"total_count": len(files), "returned": len(items), "offset": offset, "items": items}
+    return {"total_count": len(files), "returned": len(items), "offset": safe_offset, "items": items}
 
 
 @router.post("/upload", response_model=UploadResponse, summary="Upload chat history JSON")
 def upload_file(file: UploadFile = File(...)) -> UploadResponse:
-    filename = Path(file.filename or "upload.json").name
+    filename = _clean_display_filename(file.filename or "upload.json")
     if Path(filename).suffix.lower() != ".json":
-        raise HTTPException(status_code=400, detail="Only .json files are accepted.")
+        raise HTTPException(status_code=400, detail="只接受 .json 文件。")
 
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     upload_id = str(uuid.uuid4())
     target_path = UPLOAD_ROOT / f"{upload_id}.json"
+    temp_path = UPLOAD_ROOT / f"{upload_id}.json.uploading"
 
     size = 0
     try:
-        with target_path.open("xb") as target:
+        with temp_path.open("xb") as target:
             while chunk := file.file.read(1024 * 1024):
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Uploaded file is too large.")
+                    raise HTTPException(status_code=413, detail="上传文件过大。")
                 target.write(chunk)
-    except Exception:
+        if size == 0:
+            raise HTTPException(status_code=400, detail="上传文件为空。")
+        try:
+            data = _load_json_file(temp_path)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="上传文件不是合法 JSON。") from exc
+        if not is_weflow_export(data):
+            raise HTTPException(status_code=400, detail="上传文件不是 WeFlow 微信聊天导出 JSON。")
+
+        _write_upload_meta(target_path, filename, scope=stable_upload_scope(data, filename))
+        temp_path.replace(target_path)
+    except OSError as exc:
+        temp_path.unlink(missing_ok=True)
         target_path.unlink(missing_ok=True)
+        _upload_meta_path(target_path).unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="上传文件保存失败。") from exc
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        target_path.unlink(missing_ok=True)
+        _upload_meta_path(target_path).unlink(missing_ok=True)
         raise
 
-    logger.info("Ingest file uploaded", extra={"upload_id": upload_id, "filename": filename, "size": size})
+    logger.info("Ingest file uploaded", extra={"upload_id": upload_id, "upload_filename": filename, "size": size})
     return UploadResponse(
         upload_id=upload_id,
         filename=filename,
         size=size,
-        message="File uploaded successfully.",
+        message="文件上传成功。",
     )
 
 
@@ -394,13 +1108,16 @@ def list_tasks(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
+    safe_limit = query_int(limit, 50, minimum=1, maximum=200)
+    safe_offset = query_int(offset, 0, minimum=0)
+    _prune_tasks()
     with _tasks_lock:
-        ordered = sorted(_tasks, key=lambda task_id: _tasks[task_id]["created_at"], reverse=True)
-    page = ordered[offset : offset + limit]
+        ordered = sorted(_tasks, key=_task_sort_key, reverse=True)
+    page = ordered[safe_offset : safe_offset + safe_limit]
     return {
         "total_count": len(ordered),
         "returned": len(page),
-        "offset": offset,
+        "offset": safe_offset,
         "items": [_task_snapshot(task_id, include_logs=False) for task_id in page],
     }
 
@@ -408,42 +1125,92 @@ def list_tasks(
 @router.post("/start", summary="Start background ingestion")
 def start_ingest(
     req: IngestStartRequest | None = Body(default=None),
-    file_path: str | None = Query(default=None),
+    file_path: str | None = Query(default=None, max_length=MAX_INGEST_TARGET_CHARS),
 ) -> dict[str, str]:
-    if _has_running_task():
-        raise HTTPException(status_code=409, detail="Another ingest task is already running.")
-
+    req = req if isinstance(req, IngestStartRequest) else None
+    normalized_query_file_path = _normalize_target_value(file_path)
+    query_file_path = normalized_query_file_path if isinstance(normalized_query_file_path, str) else None
     upload_id = req.upload_id if req else None
     file_id = req.file_id if req else None
-    legacy_file_path = (req.file_path if req else None) or file_path
+    legacy_file_path = (req.file_path if req else None) or query_file_path
+    mode = req.mode if req else "incremental"
+    provided_targets = [
+        name
+        for name, value in (
+            ("upload_id", upload_id),
+            ("file_id", file_id),
+            ("file_path", legacy_file_path),
+        )
+        if value
+    ]
 
-    if upload_id:
+    if len(provided_targets) != 1:
+        raise HTTPException(status_code=400, detail="请且只提供 upload_id、file_id 或 file_path 中的一项。")
+
+    if upload_id is not None:
         resolved_path = _resolve_upload(upload_id)
-    elif file_id:
+    elif file_id is not None:
         resolved_path = _resolve_local_file_id(file_id)
-    elif legacy_file_path:
+    elif legacy_file_path is not None:
         resolved_path = _resolve_local_path(legacy_file_path)
     else:
-        raise HTTPException(status_code=400, detail="Provide upload_id, file_id, or file_path.")
+        raise HTTPException(status_code=400, detail="请且只提供 upload_id、file_id 或 file_path 中的一项。")
 
-    task_id = str(uuid.uuid4())
-    now = _now()
-    with _tasks_lock:
-        _tasks[task_id] = {
-            "status": "running",
-            "logs": [],
-            "created_at": now,
-            "updated_at": now,
-            "error": None,
-            "file_id": _file_id_for(resolved_path),
-            "process": None,
-        }
+    directory_targets: list[Path] | None = None
+    if resolved_path.is_dir():
+        directory_targets = _directory_json_targets(resolved_path)
+        if not directory_targets:
+            raise HTTPException(status_code=400, detail="目标目录没有可导入的 .json 文件。")
 
-    thread = threading.Thread(target=_run_ingest_task, args=(task_id, resolved_path), daemon=True)
-    thread.start()
-    logger.info("Ingest task queued", extra={"task_id": task_id, "file_id": _file_id_for(resolved_path)})
+    if mode in INDEX_ONLY_MODES:
+        if resolved_path.is_file():
+            if not _is_file_record_current(resolved_path):
+                raise HTTPException(
+                    status_code=400,
+                    detail="单项索引构建要求文件已完成导入且当前状态为已同步。",
+                )
+            if not _has_file_index_scope(resolved_path):
+                raise HTTPException(
+                    status_code=400,
+                    detail="单项索引构建要求文件已有可定位的来源映射；请先执行增量导入、全流程导入或强制重建。",
+                )
+            if mode in SESSION_CHUNK_REQUIRED_MODES:
+                index_status = _index_status_for_file(resolved_path)
+                total_chunks = index_status.get("total")
+                if not isinstance(total_chunks, int) or total_chunks <= 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="仅摘要或仅向量构建要求该 JSON 已有会话分块；请先执行仅分块、全流程导入或强制重建。",
+                    )
+        elif directory_targets is not None:
+            _validate_directory_index_scope(directory_targets, mode)
+        if mode == "summary" and not _summary_available():
+            raise HTTPException(
+                status_code=400,
+                detail="仅摘要构建要求已配置 SUMMARY_MODEL，并配置可用的 CHAT_BASE_URL 和 CHAT_API_KEY。",
+            )
+        if mode in {"embeddings", "vector"} and not _embedding_available():
+            raise HTTPException(
+                status_code=400,
+                detail="仅向量构建要求已配置 EMBED_BASE_URL、EMBED_API_KEY、EMBED_MODEL，且 sqlite-vec 可用。",
+            )
 
-    return {"task_id": task_id, "message": "Background ingest task started."}
+    task_id = _create_task_or_raise(resolved_path, mode)
+    thread = threading.Thread(target=_run_ingest_task, args=(task_id, resolved_path, mode), daemon=True)
+    try:
+        thread.start()
+    except RuntimeError as exc:
+        detail = public_exception_message("导入任务启动失败", exc)
+        _task_update(task_id, status="error", error=detail, process=None)
+        logger.error(
+            "Failed to start ingest worker thread",
+            exc_info=(type(exc), exc, exc.__traceback__),
+            extra={"task_id": task_id, "file_id": _file_id_for(resolved_path), "mode": mode},
+        )
+        raise HTTPException(status_code=500, detail=detail) from exc
+    logger.info("Ingest task queued", extra={"task_id": task_id, "file_id": _file_id_for(resolved_path), "mode": mode})
+
+    return {"task_id": task_id, "mode": mode, "message": _start_message(mode, resolved_path)}
 
 
 @router.get("/status/{task_id}", response_model=TaskStatus, summary="Get ingest task status")
@@ -457,7 +1224,7 @@ def cancel_task(task_id: str) -> TaskStatus:
     with _tasks_lock:
         task = _tasks.get(task_id)
         if task is None:
-            raise HTTPException(status_code=404, detail="Task not found.")
+            raise HTTPException(status_code=404, detail="导入任务不存在。")
         if task["status"] not in {"running", "cancel_requested"}:
             return _task_snapshot(task_id, include_logs=True)
         task["status"] = "cancel_requested"
@@ -465,12 +1232,17 @@ def cancel_task(task_id: str) -> TaskStatus:
         process = task.get("process")
         logger.info("Ingest cancel requested", extra={"task_id": task_id})
 
-    if process is not None and process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+    if process is None:
+        _task_update(task_id, status="cancelled", error=None, process=None)
+    else:
+        return_code = process.poll()
+        if return_code is not None:
+            if return_code == 0:
+                _task_update(task_id, status="completed", error=None, process=None)
+            else:
+                _task_update(task_id, status="error", error=_task_failure_error(task_id, return_code), process=None)
+        elif _terminate_process(process):
+            _task_update(task_id, status="cancelled", error=None, process=None)
 
     return _task_snapshot(task_id, include_logs=True)
 
@@ -490,7 +1262,7 @@ async def ingest_progress_stream(websocket: WebSocket, task_id: str) -> None:
                         "progress": 0,
                         "stage": "missing",
                         "eta": None,
-                        "error": "Task not found.",
+                        "error": "导入任务不存在。",
                     }
                 )
                 await websocket.close(code=1008)

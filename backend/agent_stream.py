@@ -13,10 +13,14 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 import core.agent as agent_module
 from core.llm import chat_model
 
+from .redaction import public_exception_message, redact_data, redact_text
+
 
 _abort_flags: dict[str, bool] = {}
 _abort_lock = threading.Lock()
-ABORTED_ANSWER = "(generation aborted by user)"
+ABORTED_ANSWER = "（用户已停止生成）"
+TOOL_ARGS_PREVIEW_LIMIT = 200
+TOOL_ERROR_SUMMARY_LIMIT = 160
 
 
 def set_abort_flag(session_id: str) -> None:
@@ -40,21 +44,39 @@ def _sse(event: str, data: Any) -> str:
 
 
 def _tool_result_summary(tool_content: str) -> str:
+    text_content = str(tool_content or "").strip()
     try:
-        result_data = json.loads(tool_content)
+        result_data = json.loads(text_content)
     except (json.JSONDecodeError, TypeError):
-        return "Tool call completed"
+        if text_content.startswith(("错误：", "工具执行错误：", "工具参数不是合法 JSON")):
+            return redact_text(text_content, limit=TOOL_ERROR_SUMMARY_LIMIT)
+        return "工具调用已完成"
+
+    if isinstance(result_data, dict) and result_data.get("error"):
+        detail = redact_text(result_data.get("error"), limit=TOOL_ERROR_SUMMARY_LIMIT)
+        return f"工具执行错误：{detail}" if detail else "工具执行错误"
 
     summary_parts: list[str] = []
     if "total_count" in result_data:
-        summary_parts.append(f"found {result_data['total_count']} messages")
+        summary_parts.append(f"命中 {result_data['total_count']} 条消息")
     if "returned" in result_data:
-        summary_parts.append(f"returned {result_data['returned']}")
+        summary_parts.append(f"返回 {result_data['returned']} 条")
     if "sessions" in result_data:
-        summary_parts.append(f"matched {len(result_data['sessions'])} session chunks")
+        summary_parts.append(f"匹配 {len(result_data['sessions'])} 个会话块")
     if "messages" in result_data and not summary_parts:
-        summary_parts.append(f"loaded {len(result_data['messages'])} context messages")
-    return ", ".join(summary_parts) if summary_parts else "Tool call completed"
+        summary_parts.append(f"载入 {len(result_data['messages'])} 条上下文")
+    return "，".join(summary_parts) if summary_parts else "工具调用已完成"
+
+
+def _tool_args_preview(args: Any, limit: int = TOOL_ARGS_PREVIEW_LIMIT) -> str:
+    try:
+        preview = json.dumps(redact_data(args or {}, string_limit=limit), ensure_ascii=False)
+    except (TypeError, ValueError):
+        preview = redact_text(args, limit=limit)
+
+    if len(preview) <= limit:
+        return preview
+    return preview[: max(0, limit - 1)].rstrip() + "…"
 
 
 def stream_agent(
@@ -72,6 +94,13 @@ def stream_agent(
     - ``event: error``: ``{"detail": "..."}``
     """
 
+    try:
+        question = agent_module.normalize_question(question)
+    except ValueError as exc:
+        yield _sse("error", {"detail": str(exc)})
+        return
+    agent_module.trim_history(chat_history)
+
     local = agent_module.local_reply(question)
     if local is not None:
         chat_history.extend([HumanMessage(content=question), AIMessage(content=local)])
@@ -84,11 +113,11 @@ def stream_agent(
         llm_with_tools = chat_model().bind_tools(agent_module.get_active_tools())
         llm_plain = chat_model()
     except Exception as exc:
-        yield _sse("error", {"detail": f"Agent initialization failed: {exc}"})
+        yield _sse("error", {"detail": public_exception_message("Agent 初始化失败", exc)})
         return
 
     working_messages: list[BaseMessage] = [
-        SystemMessage(content=agent_module.SYSTEM_PROMPT),
+        SystemMessage(content=agent_module.build_system_prompt()),
         *chat_history,
         HumanMessage(content=question),
     ]
@@ -136,12 +165,11 @@ def stream_agent(
                         break
                     if not full_answer:
                         full_answer = (
-                            "Search completed, but the model did not produce a useful answer. "
-                            "Try rephrasing or narrowing the time range."
+                            "检索已完成，但模型没有生成有效回答。请换一种问法，或缩小时间范围后重试。"
                         )
                         yield _sse("text", {"chunk": full_answer})
                 elif not text:
-                    full_answer = "The model returned an empty answer; this round has stopped."
+                    full_answer = "模型返回了空回答，本轮已停止。"
                     yield _sse("text", {"chunk": full_answer})
                 else:
                     full_answer = text
@@ -157,9 +185,11 @@ def stream_agent(
                     aborted_during_tools = True
                     break
 
-                args_preview = json.dumps(tool_call.get("args", {}), ensure_ascii=False)[:200]
-                yield _sse("tool_call", {"name": tool_call["name"], "args": args_preview})
-                print(f"  [tool] {tool_call['name']}({args_preview[:120]})", file=sys.stderr)
+                args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
+                tool_name = str(tool_call.get("name") or "unknown_tool") if isinstance(tool_call, dict) else "unknown_tool"
+                args_preview = _tool_args_preview(args)
+                yield _sse("tool_call", {"name": tool_name, "args": args_preview})
+                print(f"  [tool] {tool_name}({args_preview[:120]})", file=sys.stderr)
 
                 tool_msg = agent_module._run_tool_call(tool_call)
                 working_messages.append(tool_msg)
@@ -173,7 +203,7 @@ def stream_agent(
                 yield _sse(
                     "tool_result",
                     {
-                        "name": tool_call["name"],
+                        "name": tool_name,
                         "summary": _tool_result_summary(str(tool_msg.content)),
                     },
                 )
@@ -182,13 +212,12 @@ def stream_agent(
                 break
         else:
             full_answer = (
-                "The single-question tool-call limit was reached. "
-                "Try narrowing the time, person, or keyword range."
+                "已达到单次提问的工具调用轮数上限。请缩小时间、人物或关键词范围后重试。"
             )
             yield _sse("text", {"chunk": full_answer})
 
     except Exception as exc:
-        yield _sse("error", {"detail": f"Agent execution failed: {exc}"})
+        yield _sse("error", {"detail": public_exception_message("Agent 执行失败", exc)})
         return
 
     finally:

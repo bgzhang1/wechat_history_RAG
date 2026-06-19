@@ -10,8 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from dotenv import load_dotenv
 
+load_dotenv()
 DB_PATH = os.getenv("BACKEND_CHAT_DB", str(Path("runtime") / "backend_chat.db"))
+SQL_BATCH = 900
 
 SessionStatus = Literal["idle", "running", "aborting", "error"]
 
@@ -19,8 +22,12 @@ _conn: sqlite3.Connection | None = None
 _lock = threading.RLock()
 
 
+class ActiveSessionError(RuntimeError):
+    """Raised when mutating metadata for a session that is currently generating."""
+
+
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _sqlite_path(path: str) -> str:
@@ -32,17 +39,46 @@ def _sqlite_path(path: str) -> str:
     return str(db_path)
 
 
+def _sqlite_uri(path: str) -> bool:
+    return path.startswith("file:")
+
+
+def _safe_int(value: Any, default: int, minimum: int, maximum: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _batched(items: list[Any], size: int | None = None) -> list[list[Any]]:
+    batch_size = max(1, size or SQL_BATCH)
+    return [items[start : start + batch_size] for start in range(0, len(items), batch_size)]
+
+
 def db() -> sqlite3.Connection:
     global _conn
     with _lock:
         if _conn is not None:
             return _conn
-        _conn = sqlite3.connect(_sqlite_path(DB_PATH), timeout=30, check_same_thread=False)
+        _conn = sqlite3.connect(_sqlite_path(DB_PATH), timeout=30, check_same_thread=False, uri=_sqlite_uri(DB_PATH))
         _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA foreign_keys = ON")
         _conn.execute("PRAGMA journal_mode = WAL")
         _conn.execute("PRAGMA busy_timeout = 30000")
         init_schema(_conn)
         return _conn
+
+
+def close_connection() -> None:
+    global _conn
+    with _lock:
+        if _conn is not None:
+            _conn.close()
+            _conn = None
 
 
 def init_schema(conn: sqlite3.Connection | None = None) -> None:
@@ -138,8 +174,8 @@ def get_or_create_session(session_id: str | None = None) -> dict[str, Any]:
 
 
 def list_sessions(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
-    limit = max(1, min(int(limit), 200))
-    offset = max(0, int(offset))
+    limit = _safe_int(limit, 100, minimum=1, maximum=200)
+    offset = _safe_int(offset, 0, minimum=0)
     with _lock:
         rows = db().execute(
             """
@@ -163,7 +199,7 @@ def list_sessions(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
                 LIMIT 1
               ) AS last_question
             FROM backend_chat_sessions s
-            ORDER BY s.updated_at DESC
+            ORDER BY s.updated_at DESC, s.created_at DESC, s.session_id DESC
             LIMIT ? OFFSET ?
             """,
             (limit, offset),
@@ -171,14 +207,22 @@ def list_sessions(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return [_row_to_dict(row) for row in rows]
 
 
+def count_sessions() -> int:
+    with _lock:
+        return int(db().execute("SELECT COUNT(*) c FROM backend_chat_sessions").fetchone()["c"])
+
+
 def rename_session(session_id: str, title: str) -> dict[str, Any] | None:
     title = " ".join(title.strip().split())
     if not title:
-        raise ValueError("title cannot be empty")
+        raise ValueError("标题不能为空。")
     now = _now()
     with _lock:
-        if get_session(session_id) is None:
+        current = get_session(session_id)
+        if current is None:
             return None
+        if current["status"] in {"running", "aborting"}:
+            raise ActiveSessionError("session is generating")
         db().execute(
             """
             UPDATE backend_chat_sessions
@@ -191,12 +235,12 @@ def rename_session(session_id: str, title: str) -> dict[str, Any] | None:
         return get_session(session_id)
 
 
-def get_messages(session_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+def get_messages(session_id: str, limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
     with _lock:
         if limit is None:
             rows = db().execute(
                 """
-                SELECT role, content, created_at
+                SELECT id, role, content, created_at
                 FROM backend_chat_messages
                 WHERE session_id = ?
                 ORDER BY id
@@ -204,25 +248,71 @@ def get_messages(session_id: str, limit: int | None = None) -> list[dict[str, An
                 (session_id,),
             ).fetchall()
         else:
-            safe_limit = max(1, int(limit))
+            safe_limit = _safe_int(limit, 0, minimum=0)
+            if safe_limit == 0:
+                return []
+            safe_offset = _safe_int(offset, 0, minimum=0)
             rows = db().execute(
                 """
-                SELECT role, content, created_at
+                SELECT id, role, content, created_at
                 FROM (
                   SELECT id, role, content, created_at
                   FROM backend_chat_messages
                   WHERE session_id = ?
                   ORDER BY id DESC
-                  LIMIT ?
+                  LIMIT ? OFFSET ?
                 )
                 ORDER BY id
                 """,
-                (session_id, safe_limit),
+                (session_id, safe_limit, safe_offset),
             ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
 
-def append_exchange(session_id: str, question: str, answer: str) -> None:
+def count_messages(session_id: str) -> int:
+    with _lock:
+        return int(
+            db().execute(
+                "SELECT COUNT(*) c FROM backend_chat_messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()["c"]
+        )
+
+
+def last_exchange_matches(
+    session_id: str,
+    question: str,
+    *,
+    answer: str | None = None,
+    answer_contains: str | None = None,
+) -> bool:
+    normalized_question = question.strip()
+    with _lock:
+        rows = db().execute(
+            """
+            SELECT role, content
+            FROM backend_chat_messages
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT 2
+            """,
+            (session_id,),
+        ).fetchall()
+
+    if len(rows) != 2:
+        return False
+
+    assistant_row, user_row = rows[0], rows[1]
+    if assistant_row["role"] != "assistant" or user_row["role"] != "user":
+        return False
+    if user_row["content"].strip() != normalized_question:
+        return False
+    if answer is not None and assistant_row["content"] != answer:
+        return False
+    return not (answer_contains is not None and answer_contains not in assistant_row["content"])
+
+
+def append_exchange(session_id: str, question: str, answer: str, final_status: SessionStatus = "idle") -> None:
     now = _now()
     with _lock:
         get_or_create_session(session_id)
@@ -243,12 +333,12 @@ def append_exchange(session_id: str, question: str, answer: str) -> None:
                 UPDATE backend_chat_sessions
                 SET
                   title = COALESCE(title, ?),
-                  status = 'idle',
+                  status = ?,
                   last_error = NULL,
                   updated_at = ?
                 WHERE session_id = ?
                 """,
-                (_make_title(question), now, session_id),
+                (_make_title(question), final_status, now, session_id),
             )
 
 
@@ -279,6 +369,8 @@ def request_abort(session_id: str) -> str:
             return "missing"
         if current["status"] not in {"running", "aborting"}:
             return "idle"
+        if current["status"] == "aborting":
+            return "aborting"
         db().execute(
             """
             UPDATE backend_chat_sessions
@@ -288,7 +380,7 @@ def request_abort(session_id: str) -> str:
             (now, session_id),
         )
         db().commit()
-        return "aborting"
+        return "running"
 
 
 def finish(session_id: str, status: SessionStatus = "idle", last_error: str | None = None) -> None:
@@ -307,51 +399,77 @@ def finish(session_id: str, status: SessionStatus = "idle", last_error: str | No
         db().commit()
 
 
-def delete_session(session_id: str) -> bool:
+def delete_session_result(session_id: str) -> Literal["deleted", "missing", "active"]:
     with _lock:
         conn = db()
+        current = get_session(session_id)
+        if current is None:
+            return "missing"
+        if current["status"] in {"running", "aborting"}:
+            return "active"
         with conn:
-            deleted = conn.execute(
+            conn.execute(
                 "DELETE FROM backend_chat_sessions WHERE session_id = ?",
                 (session_id,),
-            ).rowcount
+            )
             conn.execute(
                 "DELETE FROM backend_chat_messages WHERE session_id = ?",
                 (session_id,),
             )
-        return deleted > 0
+        return "deleted"
+
+
+def delete_session(session_id: str) -> bool:
+    return delete_session_result(session_id) == "deleted"
 
 
 def delete_sessions(session_ids: list[str]) -> dict[str, Any]:
     unique_ids = list(dict.fromkeys(session_ids))
     if not unique_ids:
-        return {"deleted": [], "missing": []}
+        return {"deleted": [], "missing": [], "active": []}
 
     with _lock:
         conn = db()
-        existing_rows = conn.execute(
-            f"""
-            SELECT session_id
-            FROM backend_chat_sessions
-            WHERE session_id IN ({",".join("?" for _ in unique_ids)})
-            """,
-            unique_ids,
-        ).fetchall()
-        existing = {row["session_id"] for row in existing_rows}
+        existing: set[str] = set()
+        active: set[str] = set()
+        for batch in _batched(unique_ids):
+            placeholders = ",".join("?" for _ in batch)
+            existing_rows = conn.execute(
+                f"""
+                SELECT session_id
+                FROM backend_chat_sessions
+                WHERE session_id IN ({placeholders})
+                """,
+                batch,
+            ).fetchall()
+            existing.update(str(row["session_id"]) for row in existing_rows)
+            active_rows = conn.execute(
+                f"""
+                SELECT session_id
+                FROM backend_chat_sessions
+                WHERE session_id IN ({placeholders})
+                  AND status IN ('running', 'aborting')
+                """,
+                batch,
+            ).fetchall()
+            active.update(str(row["session_id"]) for row in active_rows)
         missing = [session_id for session_id in unique_ids if session_id not in existing]
+        deletable = [session_id for session_id in unique_ids if session_id in existing and session_id not in active]
 
         with conn:
-            for session_id in existing:
+            for batch in _batched(deletable):
+                placeholders = ",".join("?" for _ in batch)
                 conn.execute(
-                    "DELETE FROM backend_chat_sessions WHERE session_id = ?",
-                    (session_id,),
+                    f"DELETE FROM backend_chat_sessions WHERE session_id IN ({placeholders})",
+                    batch,
                 )
                 conn.execute(
-                    "DELETE FROM backend_chat_messages WHERE session_id = ?",
-                    (session_id,),
+                    f"DELETE FROM backend_chat_messages WHERE session_id IN ({placeholders})",
+                    batch,
                 )
 
         return {
-            "deleted": [session_id for session_id in unique_ids if session_id in existing],
+            "deleted": deletable,
             "missing": missing,
+            "active": [session_id for session_id in unique_ids if session_id in active],
         }
