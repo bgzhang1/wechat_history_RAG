@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ..console import setup_utf8_console
 from ..llm import EMBED_DIM, chat_configured, chat_model, embed, embed_configured
+from ..redaction import public_exception_message
 
 
 def main() -> None:
@@ -15,7 +16,7 @@ def main() -> None:
             print(f"ok chat 端点连通：{str(res.content).strip()}")
         except Exception as exc:
             ok = False
-            print(f"x chat 端点失败：{exc}")
+            print(f"x {public_exception_message('chat 端点失败', exc)}")
     else:
         ok = False
         print("x 未配置 CHAT_*（agent 对话必需）")
@@ -28,7 +29,7 @@ def main() -> None:
             print(f"ok embeddings 端点连通，返回维度 {len(vector)}{suffix}")
         except Exception as exc:
             ok = False
-            print(f"x embeddings 端点失败：{exc}")
+            print(f"x {public_exception_message('embeddings 端点失败', exc)}")
     else:
         print("- 未配置 EMBED_*（可选；不配则语义检索退化为全文检索）")
 

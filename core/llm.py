@@ -4,6 +4,7 @@ import os
 import time
 from functools import lru_cache
 from typing import Any, Callable, TypeVar
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -44,6 +45,14 @@ def _retry_attempts(name: str, default: int = DEFAULT_API_ATTEMPTS) -> int:
     return _env_int(name, default, minimum=1)
 
 
+def _positive_int_value(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if parsed >= 1 else default
+
+
 def _remote_api_call(
     call: Callable[[], T],
     attempts: int,
@@ -65,23 +74,60 @@ CHAT_TIMEOUT_OVERRIDE: float | None = None
 CHAT_TEMPERATURE: float = 0.0
 
 
+PLACEHOLDER_VALUES = {
+    "https://example.com/v1",
+    "http://example.com/v1",
+    "https://example.com/v1/",
+    "http://example.com/v1/",
+    "sk-...",
+    "...",
+    "changeme",
+    "change-me",
+    "your-api-key",
+    "your-key",
+    "your-chat-model",
+    "your-embedding-model",
+}
+
+
 def _configured_value(value: str | None) -> bool:
-    return bool(value and value.strip())
+    if not value or not value.strip():
+        return False
+    normalized = value.strip().lower()
+    if normalized in PLACEHOLDER_VALUES:
+        return False
+    if _uses_example_domain(normalized):
+        return False
+    return not normalized.startswith("your-")
 
 
-def chat_config_status() -> dict[str, Any]:
-    model = CHAT_MODEL_OVERRIDE or os.getenv("CHAT_MODEL")
+def _uses_example_domain(value: str) -> bool:
+    if not value.startswith(("http://", "https://", "//")):
+        return False
+    parsed = urlparse(value)
+    hostname = (parsed.hostname or "").rstrip(".")
+    return hostname == "example.com" or hostname.endswith(".example.com")
+
+
+def _env_config_value(name: str) -> str:
+    return (os.getenv(name) or "").strip()
+
+
+def chat_config_status(model: str | None = None) -> dict[str, Any]:
+    explicit_model = model.strip() if isinstance(model, str) else None
+    resolved_model = explicit_model or CHAT_MODEL_OVERRIDE or _env_config_value("CHAT_MODEL")
     required = {
-        "CHAT_BASE_URL": os.getenv("CHAT_BASE_URL"),
-        "CHAT_API_KEY": os.getenv("CHAT_API_KEY"),
-        "CHAT_MODEL": model,
+        "CHAT_BASE_URL": _env_config_value("CHAT_BASE_URL"),
+        "CHAT_API_KEY": _env_config_value("CHAT_API_KEY"),
+        "CHAT_MODEL": resolved_model,
     }
     missing = [name for name, value in required.items() if not _configured_value(value)]
     return {
         "configured": not missing,
         "missing": missing,
-        "model": model or "",
-        "using_model_override": bool(CHAT_MODEL_OVERRIDE),
+        "model": resolved_model or "",
+        "using_model_override": bool(CHAT_MODEL_OVERRIDE and not explicit_model),
+        "using_explicit_model": bool(explicit_model),
     }
 
 
@@ -91,15 +137,15 @@ def chat_configured() -> bool:
 
 def embed_config_status() -> dict[str, Any]:
     required = {
-        "EMBED_BASE_URL": os.getenv("EMBED_BASE_URL"),
-        "EMBED_API_KEY": os.getenv("EMBED_API_KEY"),
-        "EMBED_MODEL": os.getenv("EMBED_MODEL"),
+        "EMBED_BASE_URL": _env_config_value("EMBED_BASE_URL"),
+        "EMBED_API_KEY": _env_config_value("EMBED_API_KEY"),
+        "EMBED_MODEL": _env_config_value("EMBED_MODEL"),
     }
     missing = [name for name, value in required.items() if not _configured_value(value)]
     return {
         "configured": not missing,
         "missing": missing,
-        "model": os.getenv("EMBED_MODEL") or "",
+        "model": _env_config_value("EMBED_MODEL"),
     }
 
 
@@ -108,28 +154,43 @@ def embed_configured() -> bool:
 
 
 @lru_cache(maxsize=8)
-def _chat_model_cached(model: str, timeout: float, temperature: float) -> ChatOpenAI:
+def _chat_model_cached(
+    model: str,
+    base_url: str,
+    api_key: str,
+    timeout: float,
+    temperature: float,
+    max_retries: int,
+) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
-        base_url=os.environ["CHAT_BASE_URL"],
-        api_key=os.environ["CHAT_API_KEY"],
+        base_url=base_url,
+        api_key=api_key,
         temperature=temperature,
         timeout=timeout,
-        max_retries=_env_int("CHAT_MAX_RETRIES", 3, minimum=0),
+        max_retries=max_retries,
     )
 
 
 def chat_model(model: str | None = None) -> ChatOpenAI:
-    if not chat_configured():
-        missing = ", ".join(chat_config_status()["missing"])
-        raise RuntimeError(f"Chat model is not configured. Missing: {missing}")
-    actual_model = model or CHAT_MODEL_OVERRIDE or os.environ.get("CHAT_MODEL", "")
+    status = chat_config_status(model)
+    if not status["configured"]:
+        missing = ", ".join(status["missing"])
+        raise RuntimeError(f"对话模型尚未配置，缺少：{missing}")
+    actual_model = status["model"]
     actual_timeout = (
         CHAT_TIMEOUT_OVERRIDE
         if CHAT_TIMEOUT_OVERRIDE is not None
         else _env_float("CHAT_TIMEOUT", 300.0, minimum=1.0)
     )
-    return _chat_model_cached(actual_model, actual_timeout, CHAT_TEMPERATURE)
+    return _chat_model_cached(
+        actual_model,
+        _env_config_value("CHAT_BASE_URL"),
+        _env_config_value("CHAT_API_KEY"),
+        actual_timeout,
+        CHAT_TEMPERATURE,
+        _env_int("CHAT_MAX_RETRIES", 3, minimum=0),
+    )
 
 
 def invoke_chat(input: Any, model: str | None = None) -> Any:
@@ -140,35 +201,50 @@ def invoke_chat(input: Any, model: str | None = None) -> Any:
 
 
 @lru_cache(maxsize=2)
-def _embed_model_cached(model: str) -> OpenAIEmbeddings:
+def _embed_model_cached(
+    model: str,
+    base_url: str,
+    api_key: str,
+    timeout: float,
+    max_retries: int,
+) -> OpenAIEmbeddings:
     return OpenAIEmbeddings(
         model=model,
-        base_url=os.environ["EMBED_BASE_URL"],
-        api_key=os.environ["EMBED_API_KEY"],
+        base_url=base_url,
+        api_key=api_key,
         check_embedding_ctx_length=False,
-        timeout=_env_float("EMBED_TIMEOUT", 90.0, minimum=1.0),
-        max_retries=_env_int("EMBED_MAX_RETRIES", 0, minimum=0),
+        timeout=timeout,
+        max_retries=max_retries,
     )
 
 
 def embed_model() -> OpenAIEmbeddings:
     if not embed_configured():
         missing = ", ".join(embed_config_status()["missing"])
-        raise RuntimeError(f"Embedding model is not configured. Missing: {missing}")
-    return _embed_model_cached(os.environ["EMBED_MODEL"])
+        raise RuntimeError(f"Embedding 模型尚未配置，缺少：{missing}")
+    return _embed_model_cached(
+        _env_config_value("EMBED_MODEL"),
+        _env_config_value("EMBED_BASE_URL"),
+        _env_config_value("EMBED_API_KEY"),
+        _env_float("EMBED_TIMEOUT", 90.0, minimum=1.0),
+        _env_int("EMBED_MAX_RETRIES", 0, minimum=0),
+    )
 
 
 def embed(texts: list[str], batch_size: int = 32) -> list[list[float]]:
+    if not texts:
+        return []
+    safe_batch_size = _positive_int_value(batch_size, 32)
     embeddings = embed_model()
     output: list[list[float]] = []
     local_retries = _retry_attempts("EMBED_LOCAL_RETRIES")
     retry_sleep = _env_float("EMBED_RETRY_SLEEP", 1.0, minimum=0.0)
 
-    for start in range(0, len(texts), batch_size):
-        batch = texts[start : start + batch_size]
+    for start in range(0, len(texts), safe_batch_size):
+        batch = texts[start : start + safe_batch_size]
         output.extend(
             _remote_api_call(
-                lambda: embeddings.embed_documents(batch),
+                lambda batch=batch: embeddings.embed_documents(batch),
                 local_retries,
                 retry_sleep,
             )

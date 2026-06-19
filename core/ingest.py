@@ -11,8 +11,9 @@ from dotenv import load_dotenv
 from . import store
 from .chunker import Chunk, chunk_thread
 from .console import setup_utf8_console
-from .llm import chat_configured, embed, embed_configured, invoke_chat
-from .parser import is_weflow_export, parse_weflow
+from .llm import chat_config_status, embed, embed_configured, invoke_chat
+from .parser import file_scope_for_path, is_weflow_export, parse_weflow
+from .redaction import redact_text
 
 
 load_dotenv()
@@ -27,6 +28,7 @@ DEFAULT_SUMMARY_MAX_CHARS = 3000
 DEFAULT_SUMMARY_FALLBACK_CHARS = 1200
 DEFAULT_EMBED_WORKERS = 4
 DEFAULT_EMBED_BATCH_SIZE = 32
+PROGRESS_PREFIX = "__INGEST_PROGRESS__ "
 SUMMARY_BATCH_PROMPT = """请分别概括下面多个聊天块的主题和关键事项。
 只输出 JSON 数组，不要 Markdown，不要解释。
 数组长度应等于输入块数，每项格式为 {"id": 数字, "summary": "一句话摘要"}。
@@ -70,6 +72,17 @@ def env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
+def emit_progress(stage: str, progress: int, message: str = "") -> None:
+    if not env_bool("INGEST_PROGRESS_JSON", False):
+        return
+    payload = {
+        "stage": stage,
+        "progress": max(0, min(int(progress), 100)),
+        "message": message,
+    }
+    print(f"{PROGRESS_PREFIX}{json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
 def positive_int(raw: str) -> int:
     value = int(raw)
     if value < 1:
@@ -93,18 +106,36 @@ def positive_float(raw: str) -> float:
 
 def collect_json_files(target: Path) -> list[Path]:
     if target.is_file():
-        return [target]
-    return [path for path in target.iterdir() if path.is_file() and path.suffix.lower() == ".json"]
+        return [target] if target.suffix.lower() == ".json" else []
+
+    try:
+        root = target.resolve()
+    except OSError:
+        return []
+
+    files: list[Path] = []
+    for path in target.rglob("*"):
+        try:
+            if not path.is_file() or path.suffix.lower() != ".json":
+                continue
+            path.resolve().relative_to(root)
+        except (OSError, ValueError):
+            continue
+        files.append(path)
+
+    return sorted(files, key=lambda path: path.as_posix().lower())
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="导入 WeFlow 微信聊天 JSON，并构建 SQLite/FTS/向量索引。")
     parser.add_argument("targets", nargs="+", help="JSON 文件或目录，可传多个")
     parser.add_argument("--no-summary", action="store_true", help="跳过索引期摘要前缀")
+    parser.add_argument("--force-import", action="store_true", help="即使文件未变化，也重新解析 JSON 并核对消息入库")
     parser.add_argument("--force-rebuild", action="store_true", help="即使本次新增消息为 0，也强制重建 FTS、会话分块、摘要和向量索引")
     parser.add_argument("--force-fts", action="store_true", help="强制重建 FTS 全文索引")
     parser.add_argument("--force-chunks", action="store_true", help="强制重建会话分块（内容未变的块仍会复用已有摘要和向量）")
     parser.add_argument("--force-summary", action="store_true", help="强制重新生成所有摘要")
+    parser.add_argument("--skip-import", action="store_true", help="跳过 JSON 解析与消息入库，仅基于现有数据库执行索引/摘要/向量构建")
     parser.add_argument(
         "--force-embeddings",
         "--force-vector",
@@ -180,14 +211,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def compact_error(exc: Exception, limit: int = 300) -> str:
-    detail = str(exc).strip().replace("\r", " ").replace("\n", " ")
-    if not detail:
-        return type(exc).__name__
-    return detail[:limit]
+    detail = redact_text(exc, limit=limit)
+    return detail or type(exc).__name__
 
 
 def format_error_counts(errors: dict[str, int]) -> str:
     return "，".join(f"{name}×{count}" for name, count in sorted(errors.items()))
+
+
+def summary_config_reason(summary_model: str, status: dict[str, object]) -> str:
+    if not summary_model:
+        return "未配置 SUMMARY_MODEL"
+    raw_missing = status.get("missing", [])
+    missing_names = raw_missing if isinstance(raw_missing, list) else []
+    missing = ["SUMMARY_MODEL" if name == "CHAT_MODEL" else str(name) for name in missing_names]
+    if missing:
+        return "未配置 " + "、".join(missing)
+    return "摘要模型不可用"
 
 
 class SummaryBatchParseError(ValueError):
@@ -388,8 +428,63 @@ def record_pending_files(records: list[tuple[str, int, int, int, int, int]]) -> 
     records.clear()
 
 
-def load_existing_chunks() -> tuple[list[Chunk], list[int], dict[int, str]]:
-    rows = store.get_all_sessions()
+def file_key_for(file: Path) -> str:
+    return str(file.resolve())
+
+
+def record_file_message_sources(file_key: str, message_ids: list[str]) -> None:
+    existing_ids = store.resolve_existing_message_ids(message_ids)
+    store.record_ingest_file_messages(file_key, existing_ids)
+
+
+def index_scope_for_files(files: list[Path]) -> tuple[list[str], list[int]]:
+    file_keys = [file_key_for(file) for file in files]
+    prefixes = [f"{file_scope_for_path(file)}:" for file in files]
+    threads = {
+        *store.get_threads_for_ingest_file_paths(file_keys),
+        *store.get_threads_for_message_id_prefixes(prefixes),
+    }
+    session_ids = {
+        *store.get_session_ids_for_ingest_file_paths(file_keys),
+        *store.get_session_ids_for_message_id_prefixes(prefixes),
+    }
+    return sorted(threads), sorted(session_ids)
+
+
+def validate_skip_import_scope(
+    *,
+    threads: list[str],
+    session_ids: list[int],
+    force_fts: bool,
+    force_chunks: bool,
+    force_summary: bool,
+    force_embeddings: bool,
+) -> None:
+    needs_message_scope = force_fts or force_chunks
+    needs_session_scope = (force_summary or force_embeddings) and not force_chunks
+    if not any([force_fts, force_chunks, force_summary, force_embeddings]):
+        if threads or session_ids:
+            return
+        emit_progress("error", 0, "没有找到目标 JSON 的已入库索引范围")
+        print("\n[错误] 目标 JSON 尚无可定位的已入库消息或会话块。请先执行增量导入、全流程导入或强制重建。")
+        raise SystemExit(1)
+    if needs_message_scope and not threads:
+        emit_progress("error", 0, "没有找到目标 JSON 的已入库消息范围")
+        print("\n[错误] 目标 JSON 尚无可定位的已入库消息范围，无法执行 FTS 或分块构建。请先执行增量导入、全流程导入或强制重建。")
+        raise SystemExit(1)
+    if needs_session_scope and not session_ids:
+        emit_progress("error", 0, "没有找到目标 JSON 的已有会话分块")
+        print("\n[错误] 目标 JSON 尚无已有会话分块，无法执行摘要或向量构建。请先执行仅分块、全流程导入或强制重建。")
+        raise SystemExit(1)
+
+
+def load_existing_chunks(session_ids_filter: list[int] | None = None) -> tuple[list[Chunk], list[int], dict[int, str]]:
+    rows = store.get_sessions(session_ids_filter) if session_ids_filter is not None else store.get_all_sessions()
+    cleaned_summaries = {
+        int(row["session_id"]): str(row["summary"] or "").strip()
+        for row in rows
+        if str(row["summary"] or "").strip()
+    }
     chunks = [
         Chunk(
             thread=row["thread"],
@@ -398,55 +493,98 @@ def load_existing_chunks() -> tuple[list[Chunk], list[int], dict[int, str]]:
             participants=row["participants"],
             msg_ids=row["msg_ids"],
             text=row["text"],
-            summary=row["summary"],
+            summary=cleaned_summaries.get(int(row["session_id"])),
         )
         for row in rows
     ]
     session_ids = [int(row["session_id"]) for row in rows]
-    summaries = {
-        int(row["session_id"]): row["summary"]
-        for row in rows
-        if row.get("summary")
-    }
-    return chunks, session_ids, summaries
+    return chunks, session_ids, cleaned_summaries
 
 
-def ingest_files(files: list[Path], pending_file_records: list[tuple[str, int, int, int, int, int]]) -> tuple[int, int, set[str]]:
+def ingest_files(
+    files: list[Path],
+    pending_file_records: list[tuple[str, int, int, int, int, int]],
+    force_import: bool = False,
+) -> tuple[int, int, int, set[str], int, int]:
     total_included = 0
     total_inserted = 0
+    total_updated = 0
     affected_threads: set[str] = set()
-    for file in files:
-        stat = file.stat()
-        file_key = str(file.resolve())
-        if store.ingest_file_unchanged(file_key, stat.st_size, stat.st_mtime_ns):
-            print(f"  skip {file}: 文件未变化，跳过解析")
+    usable_files = 0
+    failed_files = 0
+    total_files = len(files)
+    for file_index, file in enumerate(files, start=1):
+        file_label = file.name
+        start_progress = 10 + int(((file_index - 1) / max(total_files, 1)) * 14)
+        finish_progress = 10 + int((file_index / max(total_files, 1)) * 14)
+        emit_progress("parsing", start_progress, f"解析 {file_index}/{total_files}: {file_label}")
+        try:
+            stat = file.stat()
+        except OSError as exc:
+            failed_files += 1
+            print(f"  x {file}: 文件状态读取失败（{compact_error(exc)}）")
+            emit_progress("parsing", finish_progress, f"文件读取失败 {file_index}/{total_files}: {file_label}")
             continue
+        file_key = file_key_for(file)
+        unchanged = store.ingest_file_unchanged(file_key, stat.st_size, stat.st_mtime_ns)
+        has_source_mapping = store.ingest_file_message_mapping_exists(file_key)
+        if unchanged and has_source_mapping and not force_import:
+            usable_files += 1
+            print(f"  skip {file}: 文件未变化，跳过解析")
+            emit_progress("parsing", finish_progress, f"跳过未变化文件 {file_index}/{total_files}: {file_label}")
+            continue
+        if unchanged and not force_import:
+            print(f"  map {file}: 文件未变化，补建文件来源映射")
+        elif unchanged and force_import:
+            print(f"  reparse {file}: 强制重建，重新解析未变化文件")
 
         try:
             data = json.loads(file.read_bytes())
         except Exception as exc:
-            print(f"  x {file}: JSON 解析失败（{exc}）")
+            failed_files += 1
+            print(f"  x {file}: 文件读取或 JSON 解析失败（{compact_error(exc)}）")
+            emit_progress("parsing", finish_progress, f"文件读取或 JSON 解析失败 {file_index}/{total_files}: {file_label}")
             continue
 
         if not is_weflow_export(data):
+            failed_files += 1
             print(f"  x {file}: 非 WeFlow 导出格式（缺少顶层 weflow 键），跳过")
+            emit_progress("parsing", finish_progress, f"跳过非 WeFlow 文件 {file_index}/{total_files}: {file_label}")
             continue
 
-        result = parse_weflow(data, file)
-        inserted = store.insert_messages(result.messages)
+        try:
+            result = parse_weflow(data, file)
+        except Exception as exc:
+            failed_files += 1
+            print(f"  x {file}: WeFlow 内容解析失败（{compact_error(exc)}）")
+            emit_progress("parsing", finish_progress, f"WeFlow 内容解析失败 {file_index}/{total_files}: {file_label}")
+            continue
+
+        usable_files += 1
+        write_result = store.upsert_messages(result.messages)
+        record_file_message_sources(file_key, [message.id for message in result.messages])
+        inserted = write_result.inserted
+        updated = write_result.updated
         total_included += result.included
         total_inserted += inserted
-        if inserted > 0:
-            affected_threads.add(result.thread)
-        record = (file_key, stat.st_size, stat.st_mtime_ns, result.total, result.included, inserted)
-        if inserted == 0:
+        total_updated += updated
+        if write_result.changed > 0:
+            affected_threads.update(write_result.threads or {result.thread})
+        record = (file_key, stat.st_size, stat.st_mtime_ns, result.total, result.included, write_result.changed)
+        if write_result.changed == 0:
             store.record_ingest_file(*record)
         else:
             pending_file_records.append(record)
         skipped = " ".join(f"{name}×{count}" for name, count in result.skipped_by_type.items())
         suffix = f"，跳过: {skipped}" if skipped else ""
-        print(f"  ok [{result.thread}] 总 {result.total} 条，入库 {result.included} 条（新增 {inserted}）{suffix}")
-    return total_included, total_inserted, affected_threads
+        update_suffix = f"，更新 {updated}" if updated else ""
+        print(f"  ok [{result.thread}] 总 {result.total} 条，入库 {result.included} 条（新增 {inserted}{update_suffix}）{suffix}")
+        emit_progress(
+            "parsing",
+            finish_progress,
+            f"已解析 {file_index}/{total_files}: {file_label}，入库 {result.included} 条",
+        )
+    return total_included, total_inserted, total_updated, affected_threads, usable_files, failed_files
 
 
 def rebuild_chunks_scoped(
@@ -470,8 +608,9 @@ def rebuild_chunks_scoped(
         if hit is None:
             continue
         old_summary, old_vector = hit
-        if old_summary and not force_summary:
-            carried_summaries.append((session_id, old_summary))
+        old_summary_text = str(old_summary or "").strip()
+        if old_summary_text and not force_summary:
+            carried_summaries.append((session_id, old_summary_text))
         if old_vector is not None and not force_embeddings:
             carried_vectors.append({"session_id": session_id, "embedding": old_vector})
 
@@ -490,10 +629,18 @@ def main() -> None:
     setup_utf8_console()
 
     args = parse_args()
+    emit_progress("starting", 3, "准备导入任务")
     force_fts = args.force_rebuild or args.force_fts
     force_chunks = args.force_rebuild or args.force_chunks
     force_summary = args.force_rebuild or args.force_summary
     force_embeddings = args.force_rebuild or args.force_embeddings
+    explicit_index_mode = (
+        args.skip_import
+        and not args.force_rebuild
+        and any([args.force_fts, args.force_chunks, args.force_summary, args.force_embeddings])
+    )
+    explicit_summary_only = args.skip_import and args.force_summary and not args.force_rebuild
+    explicit_embeddings_only = args.skip_import and args.force_embeddings and not args.force_rebuild
 
     files: list[Path] = []
     for raw in args.targets:
@@ -503,76 +650,223 @@ def main() -> None:
             continue
         files.extend(collect_json_files(target))
 
-    print(f"发现 {len(files)} 个 JSON 文件")
+    target_file_keys: list[str] = [str(file.resolve()) for file in files]
+    target_message_prefixes: list[str] = [f"{file_scope_for_path(file)}:" for file in files]
+    index_scope_threads: list[str] | None = None
+    index_scope_session_ids: list[int] | None = None
+    if target_message_prefixes:
+        index_scope_threads, index_scope_session_ids = index_scope_for_files(files)
+        if args.skip_import:
+            print(
+                "索引范围：目标 JSON 关联 "
+                f"{len(index_scope_threads)} 个会话、{len(index_scope_session_ids)} 个会话块"
+            )
 
     pending_file_records: list[tuple[str, int, int, int, int, int]] = []
-    total_included, total_inserted, affected_threads = ingest_files(files, pending_file_records)
+    if args.skip_import:
+        print(f"跳过 JSON 解析与入库（已选择 --skip-import；目标路径匹配 {len(files)} 个 JSON 文件）")
+        emit_progress("indexing", 20, "跳过 JSON 解析，准备构建索引")
+        if not files:
+            emit_progress("error", 0, "没有找到可构建索引的 JSON 文件")
+            print("\n[错误] 未找到可构建索引的 JSON 文件。单项索引构建需要明确的 WeFlow JSON 目标，避免误重建全库。")
+            raise SystemExit(1)
+        validate_skip_import_scope(
+            threads=index_scope_threads or [],
+            session_ids=index_scope_session_ids or [],
+            force_fts=force_fts,
+            force_chunks=force_chunks,
+            force_summary=force_summary,
+            force_embeddings=force_embeddings,
+        )
+        total_included = 0
+        total_inserted = 0
+        total_updated = 0
+        affected_threads: set[str] = set()
+        usable_files = 0
+        failed_files = 0
+    else:
+        print(f"发现 {len(files)} 个 JSON 文件")
+        emit_progress("parsing", 10, f"发现 {len(files)} 个 JSON 文件")
+        if not files:
+            emit_progress("error", 0, "没有找到 JSON 文件")
+            print("\n[错误] 未找到可导入的 JSON 文件。请检查路径是否正确，或选择包含 WeFlow 导出的目录。")
+            raise SystemExit(1)
+        (
+            total_included,
+            total_inserted,
+            total_updated,
+            affected_threads,
+            usable_files,
+            failed_files,
+        ) = ingest_files(files, pending_file_records, force_import=args.force_rebuild or args.force_import)
+        if target_message_prefixes:
+            index_scope_threads, index_scope_session_ids = index_scope_for_files(files)
+        if failed_files and usable_files == 0:
+            emit_progress("error", 0, "没有可导入的 WeFlow JSON 文件")
+            print(f"\n[错误] {failed_files} 个 JSON 文件解析或格式校验失败，没有可导入的 WeFlow 聊天记录。")
+            raise SystemExit(1)
+        emit_progress("indexing", 25, "JSON 解析与入库完成")
 
-    has_new_messages = total_inserted > 0
-    summary_model = os.getenv("SUMMARY_MODEL")
-    summary_ready = bool(summary_model) and chat_configured() and not args.no_summary
+    has_message_changes = (total_inserted + total_updated) > 0
+    summary_model = (os.getenv("SUMMARY_MODEL") or "").strip()
+    summary_status = chat_config_status(summary_model) if summary_model else {"configured": False, "missing": ["SUMMARY_MODEL"]}
+    summary_ready = bool(summary_status["configured"]) and not args.no_summary
     embed_ready = embed_configured() and store.has_vec()
 
-    # 自愈：即使没有新消息，也补齐上次中断/失败留下的缺失索引、摘要和向量
-    missing_summaries = store.count_sessions_missing_summary() if summary_ready else 0
-    missing_embeddings = len(store.get_all_session_ids_without_embedding()) if embed_ready else 0
-    missing_fts = store.count_missing_fts()
-    missing_seq = store.count_messages_missing_seq()
+    # 自愈：普通增量/全流程即使没有新消息，也补齐上次中断/失败留下的缺失项。
+    # 显式单项构建要严格按用户选择执行，避免“仅 FTS/仅向量”暗中调用模型。
+    auto_repair_missing_indexes = not explicit_index_mode
+    target_index_status = (
+        store.get_session_index_status(index_scope_session_ids)
+        if summary_ready and index_scope_session_ids is not None
+        else None
+    )
+    missing_summaries = (
+        int(target_index_status["missing_summary"])
+        if summary_ready and target_index_status is not None
+        else store.count_sessions_missing_summary()
+        if summary_ready
+        else 0
+    )
+    missing_embeddings = (
+        len(store.get_session_ids_without_embedding(index_scope_session_ids))
+        if embed_ready and index_scope_session_ids is not None
+        else len(store.get_all_session_ids_without_embedding())
+        if embed_ready
+        else 0
+    )
+    missing_fts = (
+        store.count_missing_fts_for_ingest_targets(target_file_keys, target_message_prefixes)
+        if target_message_prefixes
+        else store.count_missing_fts()
+    )
+    missing_seq = (
+        store.count_messages_missing_seq_for_ingest_targets(target_file_keys, target_message_prefixes)
+        if target_message_prefixes
+        else store.count_messages_missing_seq()
+    )
 
-    should_touch_fts = has_new_messages or force_fts or missing_fts > 0 or missing_seq > 0
-    should_rebuild_chunks = has_new_messages or force_chunks
-    should_generate_summary = (has_new_messages or force_summary or missing_summaries > 0) and not args.no_summary
-    should_build_embeddings = has_new_messages or force_embeddings or missing_embeddings > 0
+    should_touch_fts = (
+        has_message_changes
+        or force_fts
+        or (auto_repair_missing_indexes and (missing_fts > 0 or missing_seq > 0))
+    )
+    should_rebuild_chunks = has_message_changes or force_chunks
+    should_generate_summary = (
+        has_message_changes
+        or force_summary
+        or (auto_repair_missing_indexes and missing_summaries > 0)
+    ) and not args.no_summary
+    should_build_embeddings = (
+        has_message_changes
+        or force_embeddings
+        or (auto_repair_missing_indexes and missing_embeddings > 0)
+    )
 
     if not any([should_touch_fts, should_rebuild_chunks, should_generate_summary, should_build_embeddings]):
-        print("\n本次新增消息为 0，摘要和向量索引完整，无需重建。")
+        print("\n本次新增/更新消息为 0，摘要和向量索引完整，无需重建。")
         print("可按需加 --force-fts / --force-chunks / --force-summary / --force-embeddings。")
+        emit_progress("completed", 100, "无需重建")
         return
 
-    if missing_summaries and not has_new_messages and not force_summary:
+    if missing_summaries and auto_repair_missing_indexes and not has_message_changes and not force_summary:
         print(f"\n检测到 {missing_summaries} 个会话块缺少摘要，本次将自动补齐")
-    if missing_embeddings and not has_new_messages and not force_embeddings:
+    if missing_embeddings and auto_repair_missing_indexes and not has_message_changes and not force_embeddings:
         print(f"检测到 {missing_embeddings} 个会话块缺少向量，本次将自动补齐")
-    if (missing_fts or missing_seq) and not has_new_messages and not force_fts:
+    if (missing_fts or missing_seq) and auto_repair_missing_indexes and not has_message_changes and not force_fts:
         print(f"检测到 FTS 索引缺失 {missing_fts} 条 / seq 缺失 {missing_seq} 条，本次将自动补齐")
 
     if force_fts:
-        store.recompute_message_sequence()
-        store.rebuild_fts()
-        print(f"\nFTS 索引已强制全量重建（本次解析 {total_included} 条文本/引用消息，新增 {total_inserted} 条）")
-    elif has_new_messages or missing_fts or missing_seq:
-        store.recompute_message_sequence(None if missing_seq and not has_new_messages else sorted(affected_threads))
-        synced = store.sync_missing_fts()
-        print(f"\n消息入库完成（新增 {total_inserted} 条），FTS 增量索引 {synced} 条")
+        emit_progress("indexing", 30, "重建 FTS 索引")
+        if target_message_prefixes and total_updated == 0:
+            store.recompute_message_sequence(index_scope_threads)
+            rebuilt = store.rebuild_fts_for_ingest_targets(target_file_keys, target_message_prefixes)
+            print(
+                f"\nFTS 索引已按目标 JSON 重建 {rebuilt} 条"
+                f"（本次解析 {total_included} 条文本/引用消息，新增 {total_inserted} 条，更新 {total_updated} 条）"
+            )
+        else:
+            store.recompute_message_sequence()
+            store.rebuild_fts()
+            print(
+                f"\nFTS 索引已强制全量重建（本次解析 {total_included} 条文本/引用消息，"
+                f"新增 {total_inserted} 条，更新 {total_updated} 条）"
+            )
+        emit_progress("indexing", 35, "FTS 索引完成")
+    elif has_message_changes or missing_fts or missing_seq:
+        emit_progress("indexing", 30, "同步 FTS 索引")
+        sequence_scope = (
+            index_scope_threads
+            if missing_seq and not has_message_changes and target_message_prefixes
+            else None
+            if missing_seq and not has_message_changes
+            else sorted(affected_threads)
+        )
+        store.recompute_message_sequence(sequence_scope)
+        if total_updated:
+            store.rebuild_fts()
+            print(f"\n消息入库完成（新增 {total_inserted} 条，更新 {total_updated} 条），FTS 已全量刷新以同步修正内容")
+        elif target_message_prefixes:
+            synced = store.sync_missing_fts_for_ingest_targets(target_file_keys, target_message_prefixes)
+            print(f"\n消息入库完成（新增 {total_inserted} 条，更新 {total_updated} 条），目标 JSON FTS 增量索引 {synced} 条")
+        else:
+            synced = store.sync_missing_fts()
+            print(f"\n消息入库完成（新增 {total_inserted} 条，更新 {total_updated} 条），FTS 增量索引 {synced} 条")
+        emit_progress("indexing", 35, "FTS 索引完成")
     else:
         print("\n消息无变化，跳过 FTS")
+        emit_progress("indexing", 35, "跳过 FTS")
 
     chunks: list[Chunk] = []
     session_ids: list[int] = []
     summaries: dict[int, str] = {}
 
     if should_rebuild_chunks:
-        scope = None if force_chunks else sorted(affected_threads)
+        scope = (
+            index_scope_threads
+            if index_scope_threads is not None and (args.skip_import or force_chunks)
+            else (None if force_chunks else sorted(affected_threads))
+        )
+        emit_progress("chunking", 40, "重建会话分块")
         rebuild_chunks_scoped(scope, force_summary, force_embeddings)
-        chunks, session_ids, summaries = load_existing_chunks()
+        if target_message_prefixes:
+            _index_threads, index_scope_session_ids = index_scope_for_files(files)
+            if not args.skip_import and index_scope_session_ids is not None:
+                print(f"索引范围：目标 JSON 关联 {len(index_scope_session_ids)} 个会话块")
+        chunks, session_ids, summaries = load_existing_chunks(
+            index_scope_session_ids if target_message_prefixes and index_scope_session_ids is not None else None
+        )
         total_messages = store.stats()["total_messages"]
         avg = total_messages / max(len(chunks), 1)
-        print(f"全库会话分块：{len(chunks)} 个块（平均 {avg:.1f} 条/块）")
+        scope_label = "目标范围" if target_message_prefixes and index_scope_session_ids is not None else "全库"
+        print(f"{scope_label}会话分块：{len(chunks)} 个块（全库平均 {avg:.1f} 条/块）")
+        emit_progress("chunking", 45, f"会话分块完成：{len(chunks)} 个块")
     elif should_generate_summary or should_build_embeddings:
-        chunks, session_ids, summaries = load_existing_chunks()
+        chunks, session_ids, summaries = load_existing_chunks(
+            index_scope_session_ids if target_message_prefixes and index_scope_session_ids is not None else None
+        )
         if not chunks:
             print("没有可用会话分块；请先运行 --force-chunks。")
             record_pending_files(pending_file_records)
+            if explicit_summary_only or explicit_embeddings_only:
+                emit_progress("error", 0, "没有可用会话分块")
+                raise SystemExit(1)
+            emit_progress("completed", 100, "没有可用会话分块")
             return
-        print(f"复用已有会话分块：{len(chunks)} 个块")
+        scope_label = "目标范围" if target_message_prefixes and index_scope_session_ids is not None else "已有"
+        print(f"复用{scope_label}会话分块：{len(chunks)} 个块")
+        emit_progress("chunking", 45, f"复用会话分块：{len(chunks)} 个块")
     else:
         print("跳过会话分块")
 
     # ---- 摘要 / 向量流水线：摘要完成的块立即进入 embedding 批队列，两阶段并行 ----
     summary_enabled = should_generate_summary and summary_ready
     if should_generate_summary and not summary_enabled:
-        reason = "--no-summary" if args.no_summary else "未配置 SUMMARY_MODEL"
+        reason = "--no-summary" if args.no_summary else summary_config_reason(summary_model, summary_status)
         print(f"跳过摘要前缀（{reason}）")
+        if explicit_summary_only:
+            emit_progress("error", 0, f"摘要构建失败：{reason}")
+            raise SystemExit(1)
     elif not should_generate_summary:
         print("跳过摘要前缀（未请求摘要重建）")
 
@@ -581,9 +875,16 @@ def main() -> None:
         record_pending_files(pending_file_records)
         if not embed_configured():
             print("未配置 EMBED_*，跳过向量索引（semantic_search 将退化为全文检索）。配置 .env 后重跑 ingest 即可补建。")
+            if explicit_embeddings_only:
+                emit_progress("error", 0, "向量构建失败：未配置 EMBED_*")
+                raise SystemExit(1)
         else:
             print("sqlite-vec 不可用，跳过向量索引。")
+            if explicit_embeddings_only:
+                emit_progress("error", 0, "向量构建失败：sqlite-vec 不可用")
+                raise SystemExit(1)
         if not summary_enabled:
+            emit_progress("completed", 100, "向量索引不可用，已完成可执行步骤")
             return
 
     to_summarize: list[int] = []
@@ -595,12 +896,12 @@ def main() -> None:
     to_summarize_set = set(to_summarize)
 
     # 新生成的摘要会改变 embedding 输入文本，这些块的向量需要连带重建
-    if embed_ready and to_summarize and not embed_enabled:
+    if embed_ready and to_summarize and not embed_enabled and auto_repair_missing_indexes:
         embed_enabled = True
 
     to_embed_set: set[int] = set()
     if embed_enabled:
-        have_vec = store.get_session_ids_with_embedding()
+        have_vec = store.get_session_ids_with_embedding(session_ids)
         for i, sid in enumerate(session_ids):
             if force_embeddings or sid not in have_vec or i in to_summarize_set:
                 to_embed_set.add(i)
@@ -613,6 +914,7 @@ def main() -> None:
     if not to_summarize and not to_embed_set:
         record_pending_files(pending_file_records)
         print("\n无需生成摘要或向量。现在可以运行 python -m core.cli")
+        emit_progress("completed", 100, "无需生成摘要或向量")
         return
 
     batch_size = args.embed_batch_size
@@ -631,6 +933,7 @@ def main() -> None:
     reported_finished_sessions = 0
 
     if to_summarize:
+        emit_progress("summary", 55, f"准备生成 {len(to_summarize)} 个摘要")
         retry_note = (
             f"，422/BadRequest 短文本重试 {args.summary_fallback_chars} 字"
             if args.summary_fallback_chars
@@ -640,6 +943,8 @@ def main() -> None:
             f"生成摘要前缀（{summary_model}，{len(to_summarize)} 块，预计 {len(summary_batches)} 批，"
             f"批 {args.summary_batch_size}，并发 {args.summary_workers}，最多 {args.summary_max_chars} 字{retry_note}）..."
         )
+    if to_embed_set and not to_summarize:
+        emit_progress("embedding", 75, f"准备生成 {len(to_embed_set)} 个向量")
     if to_embed_set:
         print(
             f"生成 embedding（{os.getenv('EMBED_MODEL')}，{len(to_embed_set)} 块，"
@@ -647,8 +952,10 @@ def main() -> None:
         )
 
     def abort_model_error(stage: str, errors: dict[str, int], examples: dict[str, str]) -> None:
-        store.set_summaries(summary_buffer)
+        store.set_summaries(list(summary_buffer))
         summary_buffer.clear()
+        record_pending_files(pending_file_records)
+        emit_progress("error", 0, f"{stage} 失败")
         print(f"\n[错误] {stage} 失败，已停止 ingest（{format_error_counts(errors)}）。")
         for name, example in list(sorted(examples.items()))[:3]:
             print(f"  {name}: {example}")
@@ -701,7 +1008,7 @@ def main() -> None:
                         summaries[session_id] = summary
                         summary_buffer.append((session_id, summary))
                         if len(summary_buffer) >= SUMMARY_FLUSH_EVERY:
-                            store.set_summaries(summary_buffer)
+                            store.set_summaries(list(summary_buffer))
                             summary_buffer.clear()
                     generated += len(batch_summaries)
 
@@ -715,6 +1022,11 @@ def main() -> None:
                     done += len(indices)
                     if done - reported_summary_done >= args.progress_every or done == len(to_summarize):
                         print(f"  摘要 {done}/{len(to_summarize)}")
+                        emit_progress(
+                            "summary",
+                            55 + int((done / max(len(to_summarize), 1)) * 15),
+                            f"摘要 {done}/{len(to_summarize)}",
+                        )
                         reported_summary_done = done
 
                     if summary_batch_pos < len(summary_batches):
@@ -723,13 +1035,17 @@ def main() -> None:
         finally:
             summary_pool.shutdown(wait=False, cancel_futures=True)
 
-        store.set_summaries(summary_buffer)
+        store.set_summaries(list(summary_buffer))
         summary_buffer.clear()
         print(f"摘要完成：本次生成 {generated}/{len(to_summarize)}，全库 {len(summaries)}/{len(chunks)}")
+        emit_progress("summary", 70, f"摘要完成：{generated}/{len(to_summarize)}")
         if summary_errors:
             print(f"  [警告] {sum(summary_errors.values())} 条摘要请求失败（{format_error_counts(summary_errors)}）；重跑 ingest 将自动补齐")
             for name, example in list(sorted(summary_error_examples.items()))[:3]:
                 print(f"    {name}: {example}")
+
+    if to_embed_set:
+        emit_progress("embedding", 75, f"准备生成 {len(to_embed_set)} 个向量")
 
     embed_batches = [
         sorted(to_embed_set)[start : start + batch_size]
@@ -806,6 +1122,11 @@ def main() -> None:
                 f"  embedding 完成 {finished}/{len(to_embed_set)} 块"
                 f"（成功 {embedded}，失败 {embed_fail_sessions}；批次 {completed_embed_batches}/{total_embed_batches}）"
             )
+            emit_progress(
+                "embedding",
+                75 + int((finished / max(len(to_embed_set), 1)) * 20),
+                f"embedding 完成 {finished}/{len(to_embed_set)}",
+            )
             reported_finished_sessions = finished
 
     if embed_batches:
@@ -830,6 +1151,11 @@ def main() -> None:
                         f"已提交 {submitted_embed_sessions}/{len(to_embed_set)} 块，"
                         f"{len(running_embeds)} 批未返回"
                     )
+                    emit_progress(
+                        "embedding",
+                        75 + int((finished / max(len(to_embed_set), 1)) * 20),
+                        f"embedding 等待中：完成 {finished}/{len(to_embed_set)}",
+                    )
                     continue
                 for future in done_futures:
                     indices = running_embeds.pop(future)
@@ -848,6 +1174,7 @@ def main() -> None:
         print(f"\n向量索引完成（本次写入 {embedded} 块，失败 {embed_fail_sessions} 块）。现在可以运行 python -m core.cli")
     else:
         print("\n索引更新完成。现在可以运行 python -m core.cli")
+    emit_progress("completed", 100, "导入完成")
 
 
 if __name__ == "__main__":

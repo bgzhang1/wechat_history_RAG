@@ -8,6 +8,7 @@ from typing import Any
 
 GAP_MINUTES = 30
 MAX_CHARS = 800
+MAX_MESSAGE_CHARS_IN_CHUNK = 1200
 MAX_MSGS = 60
 MIN_CHARS = 50
 MERGE_GAP_HOURS = 2
@@ -33,9 +34,33 @@ def _chars(messages: list[dict[str, Any]]) -> int:
     return sum(len(message["content"]) for message in messages)
 
 
+def _chunk_content(content: Any) -> str:
+    text = str(content or "")
+    if len(text) <= MAX_MESSAGE_CHARS_IN_CHUNK:
+        return text
+    omitted = len(text) - MAX_MESSAGE_CHARS_IN_CHUNK
+    return f"{text[:MAX_MESSAGE_CHARS_IN_CHUNK]}...[已截断 {omitted} 字，使用 get_context 查看原文]"
+
+
+def _format_chunk_time_range(start: str, end: str) -> str:
+    start_label = start.replace("T", " ")[:16]
+    end_label = end.replace("T", " ")[:16]
+    if start_label[:10] == end_label[:10]:
+        end_label = end_label[11:16]
+    return f"{start_label} ~ {end_label}"
+
+
+def _format_message_lines(message: dict[str, Any]) -> str:
+    sender = str(message["sender"])
+    content = _chunk_content(message["content"])
+    lines = content.splitlines() or [""]
+    return "\n".join(f"{sender}: {line}" for line in lines)
+
+
 def chunk_thread(thread: str, messages: list[dict[str, Any]], thread_type: str = "") -> list[Chunk]:
     if not messages:
         return []
+    messages = sorted(messages, key=lambda message: (message["timestamp"], str(message.get("id", ""))))
 
     raw: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
@@ -67,6 +92,15 @@ def chunk_thread(thread: str, messages: list[dict[str, Any]], thread_type: str =
             raw[i + 1] = [*block, *next_block]
             i += 1
             continue
+        if (
+            not next_block
+            and merged
+            and _chars(block) < MIN_CHARS
+            and (_ts(block[0]) - _ts(merged[-1][-1])) / 3600 < MERGE_GAP_HOURS
+        ):
+            merged[-1] = [*merged[-1], *block]
+            i += 1
+            continue
         merged.append(block)
         i += 1
 
@@ -76,11 +110,8 @@ def chunk_thread(thread: str, messages: list[dict[str, Any]], thread_type: str =
         participants = list(dict.fromkeys(message["sender"] for message in block))
         start = block[0]["timestamp"]
         end = block[-1]["timestamp"]
-        header = (
-            f"[{start.replace('T', ' ')[:16]} ~ {end.replace('T', ' ')[11:16]}] "
-            f"{thread_type}{thread}（{'、'.join(participants)}）"
-        )
-        lines = [f"{message['sender']}: {message['content']}" for message in [*overlap, *block]]
+        header = f"[{_format_chunk_time_range(start, end)}] {thread_type}{thread}（{'、'.join(participants)}）"
+        lines = [_format_message_lines(message) for message in [*overlap, *block]]
         chunks.append(
             Chunk(
                 thread=thread,
