@@ -1,7 +1,7 @@
 <template>
   <aside class="sidebar">
     <div class="sidebar-header">
-      <button class="btn btn-primary btn-new-chat" @click="$emit('new-chat')" id="btn-new-chat">
+      <button class="btn btn-primary btn-new-chat" @click="$emit('new-chat')" :disabled="locked" id="btn-new-chat">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
         新建对话
       </button>
@@ -9,6 +9,7 @@
         v-if="selected.size > 0"
         class="btn btn-danger btn-sm"
         @click="emitBatchDelete"
+        :disabled="locked"
         id="btn-batch-delete"
       >
         删除 ({{ selected.size }})
@@ -19,11 +20,16 @@
       <div
         v-for="s in sessions"
         :key="s.session_id"
-        :class="['session-item', { active: s.session_id === activeId }]"
-        @click="$emit('select', s.session_id)"
+        :class="['session-item', { active: s.session_id === activeId, locked }]"
+        @click="selectSession(s.session_id)"
       >
         <label class="session-checkbox" @click.stop>
-          <input type="checkbox" :checked="selected.has(s.session_id)" @change="toggleSelect(s.session_id)" />
+          <input
+            type="checkbox"
+            :checked="selected.has(s.session_id)"
+            :disabled="locked || isBusy(s)"
+            @change="toggleSelect(s.session_id)"
+          />
         </label>
         <div class="session-info">
           <div class="session-title" v-if="editingId !== s.session_id">
@@ -36,28 +42,43 @@
             @keydown.enter="confirmRename(s.session_id)"
             @keydown.escape="cancelRename"
             @blur="confirmRename(s.session_id)"
-            ref="renameInput"
-            autofocus
+            :ref="setRenameInput"
           />
           <div class="session-meta">
             <span class="session-count">{{ s.message_count || 0 }} 条消息</span>
             <span class="session-time">{{ formatTime(s.updated_at) }}</span>
+            <span
+              v-if="sessionStatusLabel(s)"
+              :class="['session-status', sessionStatusClass(s)]"
+              :title="s.last_error || sessionStatusLabel(s)"
+            >
+              {{ sessionStatusLabel(s) }}
+            </span>
           </div>
         </div>
         <div class="session-actions" @click.stop>
-          <button class="btn-ghost btn-icon" @click="startRename(s)" title="重命名">
+          <button class="btn-ghost btn-icon" @click="startRename(s)" :disabled="locked || isBusy(s)" title="重命名">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
           </button>
-          <button class="btn-ghost btn-icon" @click="$emit('delete', s.session_id)" title="删除">
+          <button class="btn-ghost btn-icon" @click="$emit('delete', s.session_id)" :disabled="locked || isBusy(s)" title="删除">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
           </button>
         </div>
       </div>
 
-      <div v-if="sessions.length === 0" class="empty-state" style="padding: 2rem;">
+      <div v-if="sessions.length === 0" class="empty-state session-empty">
         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
         <span class="text-sm">暂无对话记录</span>
       </div>
+
+      <button
+        v-if="hasMore"
+        class="btn btn-ghost btn-sm load-more"
+        :disabled="locked || loadingMore"
+        @click="$emit('load-more')"
+      >
+        {{ loadingMore ? '加载中…' : `加载更多（${remainingCount}）` }}
+      </button>
     </div>
 
     <div v-else class="sidebar-loading">
@@ -67,50 +88,121 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 
 const props = defineProps({
   sessions: { type: Array, default: () => [] },
   activeId: { type: String, default: null },
   loading: { type: Boolean, default: false },
+  loadingMore: { type: Boolean, default: false },
+  totalCount: { type: Number, default: 0 },
+  locked: { type: Boolean, default: false },
+  selectionClearToken: { type: Number, default: 0 },
 })
 
-const emit = defineEmits(['select', 'new-chat', 'rename', 'delete', 'batch-delete'])
+const emit = defineEmits(['select', 'new-chat', 'rename', 'delete', 'batch-delete', 'load-more'])
 
 const selected = ref(new Set())
 const editingId = ref(null)
 const editTitle = ref('')
+const renameInput = ref(null)
+
+const remainingCount = computed(() => Math.max(0, props.totalCount - props.sessions.length))
+const hasMore = computed(() => remainingCount.value > 0)
+
+watch(
+  () => props.sessions,
+  (sessions) => {
+    const liveIds = new Set(sessions.map(session => session.session_id))
+    const busyIds = new Set(sessions.filter(isBusy).map(session => session.session_id))
+    const nextSelected = new Set([...selected.value].filter(id => liveIds.has(id) && !busyIds.has(id)))
+    if (nextSelected.size !== selected.value.size) selected.value = nextSelected
+    if (editingId.value && !liveIds.has(editingId.value)) cancelRename()
+  },
+  { deep: true },
+)
+
+watch(() => props.selectionClearToken, () => {
+  if (selected.value.size) selected.value = new Set()
+})
+
+watch(() => props.locked, (locked) => {
+  if (locked) cancelRename()
+})
 
 function toggleSelect(id) {
+  if (props.locked) return
+  const session = props.sessions.find(item => item.session_id === id)
+  if (!session || isBusy(session)) return
   const s = new Set(selected.value)
   if (s.has(id)) s.delete(id); else s.add(id)
   selected.value = s
 }
 
 function emitBatchDelete() {
+  if (props.locked) return
   emit('batch-delete', Array.from(selected.value))
-  selected.value = new Set()
 }
 
 function startRename(session) {
+  if (props.locked || isBusy(session)) return
   editingId.value = session.session_id
   editTitle.value = session.title || session.last_question || ''
+  nextTick(() => {
+    renameInput.value?.focus()
+    renameInput.value?.select()
+  })
+}
+
+function setRenameInput(el) {
+  renameInput.value = el
 }
 
 function confirmRename(sid) {
+  if (editingId.value !== sid) return
+  if (props.locked) {
+    cancelRename()
+    return
+  }
   if (editTitle.value.trim()) {
     emit('rename', { sessionId: sid, title: editTitle.value.trim() })
   }
   editingId.value = null
+  editTitle.value = ''
 }
 
 function cancelRename() {
   editingId.value = null
+  editTitle.value = ''
+}
+
+function selectSession(id) {
+  if (props.locked) return
+  emit('select', id)
+}
+
+function isBusy(session) {
+  return session.status === 'running' || session.status === 'aborting'
+}
+
+function sessionStatusLabel(session) {
+  if (session.status === 'running') return '生成中'
+  if (session.status === 'aborting') return '停止中'
+  if (session.status === 'error') return '失败'
+  return ''
+}
+
+function sessionStatusClass(session) {
+  if (session.status === 'error') return 'session-status-error'
+  if (session.status === 'aborting') return 'session-status-warning'
+  if (session.status === 'running') return 'session-status-running'
+  return ''
 }
 
 function formatTime(iso) {
   if (!iso) return ''
   const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
   const now = new Date()
   const diff = now - d
   if (diff < 60000) return '刚刚'
@@ -149,6 +241,10 @@ function formatTime(iso) {
   padding: var(--space-2);
 }
 
+.session-empty {
+  padding: var(--space-8);
+}
+
 .session-item {
   display: flex;
   align-items: center;
@@ -161,6 +257,12 @@ function formatTime(iso) {
   position: relative;
 }
 
+.session-checkbox {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+}
+
 .session-item:hover {
   background: var(--surface-glass-hover);
 }
@@ -171,8 +273,8 @@ function formatTime(iso) {
 }
 
 .session-checkbox input {
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
   cursor: pointer;
   accent-color: var(--accent-blue);
   flex-shrink: 0;
@@ -200,13 +302,32 @@ function formatTime(iso) {
 
 .session-meta {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
   margin-top: 2px;
+  min-width: 0;
 }
 
-.session-count, .session-time {
+.session-count, .session-time, .session-status {
   font-size: var(--text-xs);
   color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.session-status {
+  color: var(--accent-yellow);
+}
+
+.session-status-running {
+  color: var(--accent-blue);
+}
+
+.session-status-warning {
+  color: var(--accent-yellow);
+}
+
+.session-status-error {
+  color: var(--accent-red);
 }
 
 .session-actions {
@@ -222,7 +343,9 @@ function formatTime(iso) {
 }
 
 .session-actions .btn-ghost.btn-icon {
-  padding: 4px;
+  width: 32px;
+  height: 32px;
+  padding: 0;
   border-radius: var(--radius-sm);
   background: transparent;
   border: none;
@@ -239,10 +362,71 @@ function formatTime(iso) {
   background: var(--surface-glass-hover);
 }
 
+.session-item.locked {
+  cursor: not-allowed;
+}
+
+.session-actions .btn-ghost.btn-icon:disabled,
+.session-checkbox input:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .sidebar-loading {
   flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.load-more {
+  width: 100%;
+  margin-top: var(--space-2);
+  justify-content: center;
+}
+
+@media (max-width: 768px) {
+  .sidebar {
+    width: 100%;
+    height: 220px;
+    border-right: none;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sidebar-header {
+    padding: var(--space-3);
+  }
+
+  .session-list {
+    display: flex;
+    gap: var(--space-2);
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: var(--space-2) var(--space-3);
+  }
+
+  .session-item {
+    flex: 0 0 min(280px, calc(100vw - var(--space-6)));
+    min-width: 0;
+    align-items: flex-start;
+  }
+
+  .session-title {
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+
+  .session-actions {
+    opacity: 1;
+  }
+
+  .load-more {
+    width: auto;
+    min-width: 160px;
+    margin-top: 0;
+    flex: 0 0 auto;
+  }
 }
 </style>

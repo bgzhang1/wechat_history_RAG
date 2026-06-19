@@ -5,6 +5,7 @@ import SettingsView from './views/SettingsView.vue'
 const routes = [
   { path: '/', name: 'chat', component: ChatView, meta: { title: '对话' } },
   { path: '/settings', name: 'settings', component: SettingsView, meta: { title: '设置' } },
+  { path: '/:pathMatch(.*)*', redirect: '/' },
 ]
 
 const router = createRouter({

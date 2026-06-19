@@ -1,5 +1,5 @@
 <template>
-  <div class="messages-area" ref="scrollContainer">
+  <div class="messages-area" ref="scrollContainer" @scroll="handleScroll">
     <!-- Loading -->
     <div v-if="loading" class="messages-loading">
       <div class="spinner"></div>
@@ -25,9 +25,18 @@
 
     <!-- Messages -->
     <div v-else class="messages-list">
+      <button
+        v-if="hasOlder"
+        class="btn btn-ghost btn-sm load-older"
+        :disabled="loadingOlder || isGenerating"
+        @click="requestOlderMessages"
+      >
+        {{ loadingOlder ? '加载中…' : '加载更早消息' }}
+      </button>
+
       <div
         v-for="(msg, idx) in messages"
-        :key="idx"
+        :key="msg.id || `${msg.created_at || ''}-${idx}`"
         :class="['message', `message-${msg.role}`]"
       >
         <div class="message-avatar">
@@ -50,16 +59,34 @@
         <div v-for="(evt, idx) in toolEvents" :key="idx" class="tool-event">
           <template v-if="evt.type === 'call'">
             <div class="tool-badge tool-badge-call">
-              <div class="spinner" style="width:12px;height:12px;border-width:1.5px;"></div>
-              调用工具: <strong>{{ evt.name }}</strong>
+              <div class="spinner spinner-tool"></div>
+              <span>调用工具:</span>
+              <strong class="tool-name">{{ evt.name }}</strong>
             </div>
-            <div v-if="evt.args" class="tool-args font-mono text-xs">{{ evt.args }}</div>
+            <details v-if="hasLongToolText(evt.args)" class="tool-detail">
+              <summary>
+                <span class="tool-detail-label">参数</span>
+                <code>{{ previewToolText(evt.args) }}</code>
+              </summary>
+              <pre class="tool-args font-mono text-xs">{{ formatToolText(evt.args) }}</pre>
+            </details>
+            <div v-else-if="evt.args" class="tool-args font-mono text-xs">{{ formatToolText(evt.args) }}</div>
           </template>
           <template v-else>
-            <div class="tool-badge tool-badge-result">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-              {{ evt.name }}: <span class="text-secondary">{{ evt.summary }}</span>
+            <div :class="['tool-badge', isToolError(evt) ? 'tool-badge-error' : 'tool-badge-result']">
+              <svg v-if="isToolError(evt)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="7" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+              <strong class="tool-name">{{ evt.name }}</strong>
+              <span>:</span>
+              <span class="tool-summary text-secondary">{{ previewToolText(evt.summary, 120) }}</span>
             </div>
+            <details v-if="hasLongToolText(evt.summary, 120)" class="tool-detail">
+              <summary>
+                <span class="tool-detail-label">结果</span>
+                <code>{{ previewToolText(evt.summary, 120) }}</code>
+              </summary>
+              <pre class="tool-args font-mono text-xs">{{ formatToolText(evt.summary) }}</pre>
+            </details>
           </template>
         </div>
       </div>
@@ -90,8 +117,32 @@
 <script setup>
 import { watch, ref, nextTick } from 'vue'
 import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 
 marked.setOptions({ breaks: true, gfm: true })
+
+const MARKDOWN_SANITIZE_CONFIG = {
+  ALLOWED_TAGS: [
+    'p', 'br', 'strong', 'b', 'em', 'i', 's', 'del',
+    'code', 'pre', 'blockquote', 'ul', 'ol', 'li',
+    'a', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr',
+  ],
+  ALLOWED_ATTR: ['href', 'title', 'target', 'rel'],
+  ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel):|#|\/(?!\/)|\.{1,2}\/)/i,
+  FORBID_TAGS: [
+    'img', 'svg', 'math', 'iframe', 'object', 'embed',
+    'video', 'audio', 'source', 'picture', 'style',
+  ],
+}
+
+DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+  if (node.tagName !== 'A') return
+  const href = node.getAttribute('href') || ''
+  if (!/^https?:\/\//i.test(href)) return
+  node.setAttribute('target', '_blank')
+  node.setAttribute('rel', 'noopener noreferrer')
+})
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
@@ -99,27 +150,129 @@ const props = defineProps({
   toolEvents: { type: Array, default: () => [] },
   isGenerating: { type: Boolean, default: false },
   loading: { type: Boolean, default: false },
+  loadingOlder: { type: Boolean, default: false },
+  hasOlder: { type: Boolean, default: false },
 })
 
-defineEmits(['quick-send'])
+const emit = defineEmits(['quick-send', 'load-older'])
 
 const scrollContainer = ref(null)
+const shouldStickToBottom = ref(true)
+const pendingPrependAnchor = ref(null)
+const STICKY_SCROLL_THRESHOLD = 96
+const TOOL_PREVIEW_LIMIT = 140
+const TOOL_DETAIL_LIMIT = 1600
+const TOOL_ERROR_PREFIXES = ['错误：', '工具执行错误：', '工具参数不是合法 JSON']
 
 function renderMarkdown(text) {
   if (!text) return ''
-  return marked.parse(text)
+  return DOMPurify.sanitize(marked.parse(text), MARKDOWN_SANITIZE_CONFIG)
+}
+
+function normalizeToolText(value) {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function prettyToolText(value) {
+  const text = normalizeToolText(value)
+  if (!text) return ''
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2)
+  } catch {
+    return text
+  }
+}
+
+function truncateText(text, limit) {
+  if (text.length <= limit) return text
+  return `${text.slice(0, Math.max(0, limit - 1)).trimEnd()}…`
+}
+
+function previewToolText(value, limit = TOOL_PREVIEW_LIMIT) {
+  return truncateText(prettyToolText(value).replace(/\s+/g, ' ').trim(), limit)
+}
+
+function formatToolText(value) {
+  return truncateText(prettyToolText(value), TOOL_DETAIL_LIMIT)
+}
+
+function hasLongToolText(value, limit = TOOL_PREVIEW_LIMIT) {
+  const text = prettyToolText(value)
+  return text.length > limit || text.includes('\n')
+}
+
+function isToolError(evt) {
+  if (evt?.error === true) return true
+  const summary = normalizeToolText(evt?.summary).trim()
+  return TOOL_ERROR_PREFIXES.some(prefix => summary.startsWith(prefix))
+}
+
+function isNearBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= STICKY_SCROLL_THRESHOLD
+}
+
+function handleScroll() {
+  const el = scrollContainer.value
+  if (el) shouldStickToBottom.value = isNearBottom(el)
 }
 
 function scrollToBottom() {
   nextTick(() => {
     const el = scrollContainer.value
-    if (el) el.scrollTop = el.scrollHeight
+    if (!el || !shouldStickToBottom.value) return
+    el.scrollTop = el.scrollHeight
   })
 }
 
-watch(() => props.messages.length, scrollToBottom)
+function requestOlderMessages() {
+  const el = scrollContainer.value
+  pendingPrependAnchor.value = el
+    ? { scrollHeight: el.scrollHeight, scrollTop: el.scrollTop }
+    : null
+  emit('load-older')
+}
+
+function restorePrependScroll() {
+  nextTick(() => {
+    const el = scrollContainer.value
+    const anchor = pendingPrependAnchor.value
+    pendingPrependAnchor.value = null
+    if (!el || !anchor) return
+    el.scrollTop = el.scrollHeight - anchor.scrollHeight + anchor.scrollTop
+    shouldStickToBottom.value = false
+  })
+}
+
+watch(
+  () => props.messages.length,
+  (length, previousLength) => {
+    if (pendingPrependAnchor.value && length > previousLength) {
+      restorePrependScroll()
+      return
+    }
+    const lastMessage = props.messages[length - 1]
+    if (length < previousLength || lastMessage?.role === 'user') {
+      shouldStickToBottom.value = true
+    }
+    scrollToBottom()
+  },
+)
 watch(() => props.streamingText, scrollToBottom)
 watch(() => props.toolEvents.length, scrollToBottom)
+watch(
+  () => props.loadingOlder,
+  (loading, wasLoading) => {
+    if (!loading && wasLoading && pendingPrependAnchor.value) {
+      pendingPrependAnchor.value = null
+    }
+  },
+)
 </script>
 
 <style scoped>
@@ -213,6 +366,11 @@ watch(() => props.toolEvents.length, scrollToBottom)
   gap: var(--space-4);
 }
 
+.load-older {
+  align-self: center;
+  min-width: 132px;
+}
+
 .message {
   display: flex;
   gap: var(--space-3);
@@ -250,13 +408,14 @@ watch(() => props.toolEvents.length, scrollToBottom)
   color: var(--text-muted);
   margin-bottom: var(--space-1);
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
 }
 
 .message-text {
   font-size: var(--text-base);
   line-height: 1.7;
   color: var(--text-primary);
+  overflow-wrap: anywhere;
 }
 
 .message-user .message-text {
@@ -276,15 +435,19 @@ watch(() => props.toolEvents.length, scrollToBottom)
 
 .tool-event {
   animation: fadeIn var(--transition-fast) ease-out;
+  min-width: 0;
 }
 
 .tool-badge {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--space-2);
   font-size: var(--text-xs);
   padding: var(--space-1) var(--space-3);
   border-radius: var(--radius-full);
+  max-width: 100%;
+  line-height: 1.5;
 }
 
 .tool-badge-call {
@@ -299,16 +462,66 @@ watch(() => props.toolEvents.length, scrollToBottom)
   border: 1px solid rgba(16, 185, 129, 0.15);
 }
 
+.tool-badge-error {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--accent-red);
+  border: 1px solid rgba(239, 68, 68, 0.18);
+}
+
+.tool-name,
+.tool-summary {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.spinner-tool {
+  width: 12px;
+  height: 12px;
+  border-width: 1.5px;
+}
+
+.tool-detail {
+  max-width: min(100%, 560px);
+  margin-top: var(--space-1);
+}
+
+.tool-detail summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  list-style-position: inside;
+}
+
+.tool-detail summary code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-detail-label {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
 .tool-args {
   margin-top: var(--space-1);
   padding: var(--space-2) var(--space-3);
   background: rgba(0,0,0,0.2);
   border-radius: var(--radius-sm);
   color: var(--text-muted);
-  max-width: 500px;
-  overflow-x: auto;
+  max-width: min(100%, 560px);
+  max-height: 220px;
+  overflow: auto;
   white-space: pre-wrap;
-  word-break: break-all;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 /* Streaming */
@@ -350,4 +563,35 @@ watch(() => props.toolEvents.length, scrollToBottom)
 
 .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
 .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@media (max-width: 768px) {
+  .messages-area {
+    padding: var(--space-4);
+  }
+
+  .welcome-state {
+    justify-content: flex-start;
+    padding-top: var(--space-6);
+  }
+
+  .welcome-suggestions {
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .suggestion-chip {
+    width: 100%;
+  }
+
+  .tool-events,
+  .generating-indicator {
+    padding-left: 0;
+  }
+
+  .tool-badge,
+  .tool-detail,
+  .tool-args {
+    max-width: 100%;
+  }
+}
 </style>

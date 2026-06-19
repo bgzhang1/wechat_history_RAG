@@ -1,11 +1,20 @@
 <template>
   <div class="chat-input-area">
     <!-- Suggestions dropdown -->
-    <div v-if="suggestions.length > 0 && showSuggestions" class="suggestions-dropdown">
+    <div
+      v-if="suggestionsVisible"
+      id="chat-suggestion-list"
+      class="suggestions-dropdown"
+      role="listbox"
+      aria-label="联系人和群聊建议"
+    >
       <div
         v-for="(s, idx) in suggestions"
-        :key="idx"
+        :id="suggestionId(idx)"
+        :key="suggestionKey(s, idx)"
         :class="['suggestion-item', { active: selectedSuggestionIdx === idx }]"
+        role="option"
+        :aria-selected="selectedSuggestionIdx === idx ? 'true' : 'false'"
         @mousedown.prevent="applySuggestion(s)"
       >
         <span :class="['suggestion-type', `type-${s.type}`]">{{ s.type === 'sender' ? '联系人' : '群聊' }}</span>
@@ -19,8 +28,15 @@
         ref="inputEl"
         v-model="text"
         class="chat-textarea"
-        :placeholder="isGenerating ? '等待回复中…' : '输入你的问题… (Enter 发送, Shift+Enter 换行)'"
+        :placeholder="isGenerating ? '等待回复中…' : '输入你的问题…'"
         :disabled="disabled"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-haspopup="listbox"
+        aria-controls="chat-suggestion-list"
+        :aria-expanded="suggestionsVisible ? 'true' : 'false'"
+        :aria-activedescendant="activeSuggestionId"
+        :maxlength="MAX_QUESTION_CHARS"
         @keydown="handleKeydown"
         @input="handleInput"
         @focus="onFocus"
@@ -55,7 +71,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { getSuggestions } from '../api/api.js'
 
 const props = defineProps({
@@ -70,20 +86,36 @@ const inputEl = ref(null)
 const suggestions = ref([])
 const showSuggestions = ref(false)
 const selectedSuggestionIdx = ref(-1)
+const suggestionsVisible = computed(() => showSuggestions.value && suggestions.value.length > 0)
+const activeSuggestionId = computed(() => (
+  suggestionsVisible.value && selectedSuggestionIdx.value >= 0
+    ? suggestionId(selectedSuggestionIdx.value)
+    : undefined
+))
 
 let suggestTimer = null
+let blurTimer = null
+let suggestRequestSeq = 0
+let activeSuggestController = null
+const MAX_QUESTION_CHARS = 8000
+const MAX_SUGGESTION_QUERY_CHARS = 120
 
 function send() {
-  if (!text.value.trim() || props.disabled) return
-  emit('send', text.value.trim())
+  const question = text.value.trim().slice(0, MAX_QUESTION_CHARS)
+  if (!question || props.disabled || props.isGenerating) return
+  emit('send', question)
   text.value = ''
-  suggestions.value = []
-  showSuggestions.value = false
+  closeSuggestions()
   autoResize()
 }
 
 function handleKeydown(e) {
-  if (showSuggestions.value && suggestions.value.length > 0) {
+  if (suggestionsVisible.value) {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      closeSuggestions()
+      return
+    }
     if (e.key === 'ArrowDown') {
       e.preventDefault()
       selectedSuggestionIdx.value = (selectedSuggestionIdx.value + 1) % suggestions.value.length
@@ -94,7 +126,12 @@ function handleKeydown(e) {
       selectedSuggestionIdx.value = (selectedSuggestionIdx.value - 1 + suggestions.value.length) % suggestions.value.length
       return
     }
-    if (e.key === 'Tab' || (e.key === 'Enter' && selectedSuggestionIdx.value >= 0)) {
+    if (e.key === 'Tab') {
+      e.preventDefault()
+      applySuggestion(suggestions.value[Math.max(selectedSuggestionIdx.value, 0)])
+      return
+    }
+    if (e.key === 'Enter' && selectedSuggestionIdx.value >= 0) {
       e.preventDefault()
       applySuggestion(suggestions.value[selectedSuggestionIdx.value])
       return
@@ -121,47 +158,119 @@ function autoResize() {
   })
 }
 
+function suggestionQuery() {
+  const cursor = inputEl.value?.selectionStart ?? text.value.length
+  const beforeCursor = text.value.slice(0, cursor)
+  const match = beforeCursor.match(/[^\s,，。！？；;:：、]*$/)
+  return (match?.[0] || '').trim().slice(0, MAX_SUGGESTION_QUERY_CHARS)
+}
+
 function debounceSuggest() {
   clearTimeout(suggestTimer)
-  const val = text.value.trim()
+  if (props.disabled || props.isGenerating) {
+    closeSuggestions()
+    return
+  }
+  const val = suggestionQuery()
+  const requestSeq = ++suggestRequestSeq
+  activeSuggestController?.abort()
+  activeSuggestController = null
   if (!val || val.length < 1) {
-    suggestions.value = []
-    showSuggestions.value = false
+    closeSuggestions()
     return
   }
   suggestTimer = setTimeout(async () => {
+    const controller = new AbortController()
+    activeSuggestController = controller
     try {
-      const res = await getSuggestions(val, 8)
+      const res = await getSuggestions(val, 8, { signal: controller.signal })
+      if (requestSeq !== suggestRequestSeq) return
       suggestions.value = res.items || []
       showSuggestions.value = suggestions.value.length > 0
       selectedSuggestionIdx.value = -1
     } catch {
+      if (requestSeq !== suggestRequestSeq) return
       suggestions.value = []
+      showSuggestions.value = false
+      selectedSuggestionIdx.value = -1
+    } finally {
+      if (activeSuggestController === controller) activeSuggestController = null
     }
   }, 250)
 }
 
 function applySuggestion(s) {
-  text.value = text.value + s.value + ' '
-  showSuggestions.value = false
+  if (!s?.value) return
+  const el = inputEl.value
+  const cursor = el?.selectionStart ?? text.value.length
+  const beforeCursor = text.value.slice(0, cursor)
+  const afterCursor = text.value.slice(cursor)
+  const prefix = beforeCursor.replace(/[^\s,，。！？；;:：、]*$/, '')
+  const separator = afterCursor && !/^[\s,，。！？；;:：、]/.test(afterCursor) ? ' ' : ''
+  const nextText = `${prefix}${s.value}${separator}${afterCursor}`
+  const nextCursor = prefix.length + s.value.length + (separator ? 1 : 0)
+  const boundedText = nextText.slice(0, MAX_QUESTION_CHARS)
+  const boundedCursor = Math.min(nextCursor, boundedText.length)
+  text.value = boundedText
+  closeSuggestions()
+  nextTick(() => {
+    inputEl.value?.focus()
+    inputEl.value?.setSelectionRange(boundedCursor, boundedCursor)
+    autoResize()
+  })
+}
+
+function closeSuggestions() {
+  clearTimeout(suggestTimer)
+  suggestTimer = null
+  activeSuggestController?.abort()
+  activeSuggestController = null
+  suggestRequestSeq += 1
   suggestions.value = []
-  inputEl.value?.focus()
+  showSuggestions.value = false
+  selectedSuggestionIdx.value = -1
+}
+
+function suggestionId(idx) {
+  return `chat-suggestion-${idx}`
+}
+
+function suggestionKey(s, idx) {
+  return `${s?.type || 'unknown'}:${s?.value || idx}`
 }
 
 function onFocus() {
-  if (suggestions.value.length > 0) showSuggestions.value = true
+  clearTimeout(blurTimer)
+  blurTimer = null
+  if (!props.disabled && !props.isGenerating && suggestions.value.length > 0) {
+    showSuggestions.value = true
+  }
 }
 
 function onBlur() {
-  setTimeout(() => { showSuggestions.value = false }, 150)
+  clearTimeout(blurTimer)
+  blurTimer = setTimeout(() => {
+    blurTimer = null
+    showSuggestions.value = false
+  }, 150)
 }
+
+watch(
+  () => [props.disabled, props.isGenerating],
+  ([disabled, isGenerating]) => {
+    if (disabled || isGenerating) closeSuggestions()
+  },
+)
 
 onMounted(() => {
   inputEl.value?.focus()
 })
 
 onUnmounted(() => {
+  clearTimeout(blurTimer)
+  blurTimer = null
   clearTimeout(suggestTimer)
+  closeSuggestions()
 })
 </script>
 
@@ -275,11 +384,25 @@ onUnmounted(() => {
 
 .suggestion-value {
   flex: 1;
+  min-width: 0;
   font-size: var(--text-sm);
   color: var(--text-primary);
+  overflow-wrap: anywhere;
 }
 
 .suggestion-count {
   flex-shrink: 0;
+}
+
+@media (max-width: 768px) {
+  .chat-input-area {
+    padding: var(--space-3) var(--space-4) var(--space-4);
+  }
+
+  .suggestions-dropdown {
+    left: var(--space-4);
+    right: var(--space-4);
+    max-width: none;
+  }
 }
 </style>

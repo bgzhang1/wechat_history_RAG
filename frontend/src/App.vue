@@ -43,13 +43,107 @@ import { ref, provide } from 'vue'
 
 const toasts = ref([])
 let toastId = 0
+const MAX_TOASTS = 4
+const MAX_TOAST_CHARS = 260
 
 function showToast(message, type = 'info', duration = 3000) {
+  const normalized = normalizeToastMessage(message)
+  if (toasts.value.some(t => t.type === type && t.message === normalized)) return
   const id = ++toastId
-  toasts.value.push({ id, message, type })
+  toasts.value = [...toasts.value, { id, message: normalized, type }].slice(-MAX_TOASTS)
   setTimeout(() => {
     toasts.value = toasts.value.filter(t => t.id !== id)
   }, duration)
+}
+
+function normalizeToastMessage(message) {
+  const text = toastTextFromValue(message)
+  const singleLine = text.replace(/\s+/g, ' ').trim() || '操作失败'
+  return singleLine.length > MAX_TOAST_CHARS
+    ? `${singleLine.slice(0, MAX_TOAST_CHARS)}...`
+    : singleLine
+}
+
+function toastTextFromValue(message) {
+  if (typeof message === 'string') return message
+  const detailText = firstDetailText(
+    message?.message,
+    message?.error?.message,
+    message?.body?.error?.message,
+    message?.body?.detail,
+    message?.body?.message,
+    message?.detail,
+    message?.error?.details,
+    message?.body?.error?.details,
+  )
+  if (detailText) return detailText
+  const serialized = safeJsonStringify(message)
+  if (serialized && serialized !== 'null' && serialized !== '{}') return serialized
+  return '操作失败'
+}
+
+function detailTextFromValue(detail) {
+  return detailTextFromValueInner(detail, new WeakSet())
+}
+
+function detailTextFromValueInner(detail, seen) {
+  const scalar = scalarToastText(detail)
+  if (scalar) return scalar
+  if (detail && typeof detail === 'object') {
+    if (seen.has(detail)) return '[Circular]'
+    seen.add(detail)
+  }
+  if (Array.isArray(detail)) {
+    return detail.map((item) => detailTextFromValueInner(item, seen)).filter(Boolean).join('；')
+  }
+  if (detail && typeof detail === 'object') {
+    const message = firstDetailTextWithSeen(seen, detail.msg, detail.message, detail.detail, detail.type)
+    if (message) {
+      const fieldPath = fieldPathFromDetail(detail.loc || detail.field || detail.path)
+      return fieldPath ? `${fieldPath}: ${message}` : message
+    }
+    const serialized = safeJsonStringify(detail)
+    return serialized && serialized !== '{}' ? serialized : ''
+  }
+  return ''
+}
+
+function firstDetailText(...values) {
+  return firstDetailTextWithSeen(new WeakSet(), ...values)
+}
+
+function firstDetailTextWithSeen(seen, ...values) {
+  for (const value of values) {
+    const text = detailTextFromValueInner(value, seen)
+    if (text) return text
+  }
+  return ''
+}
+
+function scalarToastText(value) {
+  if (typeof value === 'string') return value.trim()
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return ''
+}
+
+function fieldPathFromDetail(loc) {
+  if (Array.isArray(loc)) return loc.filter((item) => item !== 'body').map(String).join('.')
+  return scalarToastText(loc)
+}
+
+function safeJsonStringify(value) {
+  const seen = new WeakSet()
+  try {
+    return JSON.stringify(value, (_key, item) => {
+      if (typeof item === 'object' && item !== null) {
+        if (seen.has(item)) return '[Circular]'
+        seen.add(item)
+      }
+      return item
+    })
+  } catch {
+    return ''
+  }
 }
 
 provide('toast', showToast)
@@ -90,7 +184,7 @@ provide('toast', showToast)
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
 }
 
 .navbar-links {
@@ -124,5 +218,22 @@ provide('toast', showToast)
 .main-content {
   flex: 1;
   overflow: hidden;
+}
+
+@media (max-width: 768px) {
+  .navbar {
+    height: auto;
+    min-height: var(--navbar-height);
+    padding: var(--space-2) var(--space-3);
+    gap: var(--space-2);
+  }
+
+  .navbar-title {
+    font-size: var(--text-base);
+  }
+
+  .nav-link {
+    padding: var(--space-2);
+  }
 }
 </style>
