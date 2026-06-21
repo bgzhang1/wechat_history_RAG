@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 DB_PATH = os.getenv("BACKEND_CHAT_DB", str(Path("runtime") / "backend_chat.db"))
 SQL_BATCH = 900
+REASONING_COLUMN = "reasoning_content"
 
 SessionStatus = Literal["idle", "running", "aborting", "error"]
 
@@ -112,12 +113,7 @@ def init_schema(conn: sqlite3.Connection | None = None) -> None:
               ON backend_chat_sessions(updated_at);
             """
         )
-        columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(backend_chat_messages)").fetchall()
-        }
-        if "reasoning_content" not in columns:
-            conn.execute("ALTER TABLE backend_chat_messages ADD COLUMN reasoning_content TEXT")
+        _ensure_reasoning_column_unlocked(conn)
         conn.execute(
             """
             UPDATE backend_chat_sessions
@@ -129,7 +125,24 @@ def init_schema(conn: sqlite3.Connection | None = None) -> None:
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return dict(row)
+    data = dict(row)
+    data.setdefault(REASONING_COLUMN, None)
+    return data
+
+
+def _ensure_reasoning_column_unlocked(conn: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(backend_chat_messages)").fetchall()
+    }
+    if REASONING_COLUMN in columns:
+        return
+    try:
+        conn.execute(f"ALTER TABLE backend_chat_messages ADD COLUMN {REASONING_COLUMN} TEXT")
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
 
 
 def _make_title(question: str) -> str:
@@ -244,8 +257,10 @@ def rename_session(session_id: str, title: str) -> dict[str, Any] | None:
 
 def get_messages(session_id: str, limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
     with _lock:
+        conn = db()
+        _ensure_reasoning_column_unlocked(conn)
         if limit is None:
-            rows = db().execute(
+            rows = conn.execute(
                 """
                 SELECT id, role, content, reasoning_content, created_at
                 FROM backend_chat_messages
@@ -259,11 +274,11 @@ def get_messages(session_id: str, limit: int | None = None, offset: int = 0) -> 
             if safe_limit == 0:
                 return []
             safe_offset = _safe_int(offset, 0, minimum=0)
-            rows = db().execute(
+            rows = conn.execute(
                 """
                 SELECT id, role, content, reasoning_content, created_at
                 FROM (
-                  SELECT id, role, content, created_at
+                  SELECT id, role, content, reasoning_content, created_at
                   FROM backend_chat_messages
                   WHERE session_id = ?
                   ORDER BY id DESC
@@ -330,6 +345,7 @@ def append_exchange(
     with _lock:
         get_or_create_session(session_id)
         conn = db()
+        _ensure_reasoning_column_unlocked(conn)
         with conn:
             conn.executemany(
                 """
