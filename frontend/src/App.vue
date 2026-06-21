@@ -9,19 +9,38 @@
         <span class="navbar-title">WeChat RAG</span>
       </div>
 
-      <div class="navbar-links">
-        <router-link to="/" class="nav-link" active-class="active" exact>
+      <div class="navbar-actions">
+        <div class="navbar-links">
+          <router-link to="/" class="nav-link" active-class="active" exact>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
           </svg>
           对话
-        </router-link>
-        <router-link to="/settings" class="nav-link" active-class="active">
+          </router-link>
+          <router-link to="/settings" class="nav-link" active-class="active">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
           </svg>
           设置
-        </router-link>
+          </router-link>
+        </div>
+
+        <button
+          class="theme-toggle"
+          type="button"
+          :aria-pressed="isDarkTheme ? 'true' : 'false'"
+          :title="isDarkTheme ? '切换到浅色主题' : '切换到深色主题'"
+          @click="toggleTheme"
+        >
+          <span class="sr-only">{{ isDarkTheme ? '切换到浅色主题' : '切换到深色主题' }}</span>
+          <svg v-if="isDarkTheme" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="4"/>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+          </svg>
+          <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
       </div>
     </nav>
 
@@ -39,12 +58,37 @@
 </template>
 
 <script setup>
-import { ref, provide } from 'vue'
+import { computed, onMounted, ref, provide } from 'vue'
 
 const toasts = ref([])
+const theme = ref('light')
 let toastId = 0
 const MAX_TOASTS = 4
 const MAX_TOAST_CHARS = 260
+const THEME_STORAGE_KEY = 'wechat-rag-theme'
+
+const isDarkTheme = computed(() => theme.value === 'dark')
+
+onMounted(() => {
+  theme.value = resolveInitialTheme()
+  applyTheme(theme.value)
+})
+
+function resolveInitialTheme() {
+  const stored = window.localStorage.getItem(THEME_STORAGE_KEY)
+  if (stored === 'light' || stored === 'dark') return stored
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function toggleTheme() {
+  theme.value = isDarkTheme.value ? 'light' : 'dark'
+  window.localStorage.setItem(THEME_STORAGE_KEY, theme.value)
+  applyTheme(theme.value)
+}
+
+function applyTheme(nextTheme) {
+  document.documentElement.classList.toggle('dark', nextTheme === 'dark')
+}
 
 function showToast(message, type = 'info', duration = 3000) {
   const normalized = normalizeToastMessage(message)
@@ -162,10 +206,10 @@ provide('toast', showToast)
   align-items: center;
   justify-content: space-between;
   height: var(--navbar-height);
-  padding: 0 var(--space-6);
-  background: rgba(17, 24, 39, 0.8);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  padding: 0 var(--space-5);
+  background: color-mix(in srgb, var(--bg-secondary) 88%, transparent);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
   z-index: 100;
@@ -174,29 +218,48 @@ provide('toast', showToast)
 .navbar-brand {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.navbar-brand svg {
+  width: 34px;
+  height: 34px;
+  padding: 7px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-elevated) 76%, transparent);
 }
 
 .navbar-title {
-  font-size: var(--text-lg);
+  font-size: 0.95rem;
   font-weight: 700;
-  background: var(--gradient-brand);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  color: var(--text-primary);
   letter-spacing: 0;
+}
+
+.navbar-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 .navbar-links {
   display: flex;
+  align-items: center;
   gap: var(--space-1);
+  padding: 4px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-elevated) 60%, transparent);
 }
 
 .nav-link {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-4);
+  min-height: 34px;
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-md);
   font-size: var(--text-sm);
   font-weight: 500;
@@ -212,7 +275,28 @@ provide('toast', showToast)
 
 .nav-link.active {
   color: var(--text-primary);
-  background: var(--surface-glass-active);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-sm);
+}
+
+.theme-toggle {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-elevated) 72%, transparent);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.theme-toggle:hover {
+  background: var(--surface-glass-hover);
+  color: var(--text-primary);
+  border-color: var(--border-default);
 }
 
 .main-content {
@@ -234,6 +318,10 @@ provide('toast', showToast)
 
   .nav-link {
     padding: var(--space-2);
+  }
+
+  .navbar-actions {
+    gap: var(--space-1);
   }
 }
 </style>

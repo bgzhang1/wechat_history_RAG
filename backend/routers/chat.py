@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import uuid
 from collections.abc import Generator
 from typing import Annotated, Any
 
@@ -26,6 +28,9 @@ STOPPED_MARKER = "已停止生成"
 MAX_PARTIAL_ANSWER_CHARS = 20000
 SessionIdPath = Annotated[str, ApiPath(min_length=1, max_length=120)]
 SessionIdField = Annotated[str, Field(min_length=1, max_length=120)]
+_run_lock = threading.Lock()
+_active_runs: dict[str, str] = {}
+_aborted_runs: set[tuple[str, str]] = set()
 
 
 class RenameSessionRequest(BaseModel):
@@ -125,12 +130,45 @@ def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _register_run(session_id: str) -> str:
+    run_id = str(uuid.uuid4())
+    with _run_lock:
+        _active_runs[session_id] = run_id
+    return run_id
+
+
+def _mark_active_run_aborted(session_id: str) -> str | None:
+    with _run_lock:
+        run_id = _active_runs.get(session_id)
+        if run_id:
+            _aborted_runs.add((session_id, run_id))
+        return run_id
+
+
+def _run_is_aborted(session_id: str, run_id: str | None) -> bool:
+    if not run_id:
+        return False
+    with _run_lock:
+        return (session_id, run_id) in _aborted_runs
+
+
+def _clear_run(session_id: str, run_id: str | None) -> None:
+    if not run_id:
+        return
+    with _run_lock:
+        if _active_runs.get(session_id) == run_id:
+            _active_runs.pop(session_id, None)
+        _aborted_runs.discard((session_id, run_id))
+
+
 def _stream_and_persist(
     question: str,
     history: list[BaseMessage],
     session_id: str,
+    run_id: str | None = None,
 ) -> Generator[str, None, None]:
     final_answer: str | None = None
+    final_thinking: str = ""
     error_detail: str | None = None
     saw_done = False
     persisted = False
@@ -142,17 +180,20 @@ def _stream_and_persist(
             answer_contains=STOPPED_MARKER,
         )
 
-    def persist_done_answer(answer: str) -> None:
+    def persist_done_answer(answer: str, thinking: str = "") -> None:
         nonlocal persisted
         session = session_store.get_session(session_id)
         already_saved_abort = (
-            stopped_exchange_saved()
-            and (ABORTED_ANSWER in answer or bool(session and session["status"] == "aborting"))
+            _run_is_aborted(session_id, run_id)
+            or (
+                stopped_exchange_saved()
+                and (ABORTED_ANSWER in answer or bool(session and session["status"] == "aborting"))
+            )
         )
         if already_saved_abort:
             session_store.finish(session_id, "idle")
         else:
-            session_store.append_exchange(session_id, question, answer)
+            session_store.append_exchange(session_id, question, answer, answer_reasoning=thinking)
         persisted = True
 
     try:
@@ -164,11 +205,16 @@ def _stream_and_persist(
             event_name, data = _parse_sse_event(payload)
             if event_name == "done" and data is not None:
                 final_answer = str(data.get("answer", ""))
+                final_thinking = str(data.get("thinking") or final_thinking or "")
                 saw_done = True
-                persist_done_answer(final_answer)
+                persist_done_answer(final_answer, final_thinking)
+            elif event_name == "thinking" and data is not None:
+                final_thinking += str(data.get("chunk") or "")
             elif event_name == "error":
                 session = session_store.get_session(session_id)
-                if stopped_exchange_saved() and session and session["status"] == "aborting":
+                if _run_is_aborted(session_id, run_id) or (
+                    stopped_exchange_saved() and session and session["status"] == "aborting"
+                ):
                     session_store.finish(session_id, "idle")
                     saw_done = True
                     persisted = True
@@ -180,7 +226,7 @@ def _stream_and_persist(
 
         if saw_done:
             if not persisted:
-                persist_done_answer(final_answer or "")
+                persist_done_answer(final_answer or "", final_thinking)
         elif error_detail:
             session_store.finish(session_id, "error", error_detail)
         else:
@@ -197,16 +243,24 @@ def _stream_and_persist(
             session_store.finish(session_id, "error", error_detail)
         else:
             session = session_store.get_session(session_id)
-            user_requested_stop = bool(session and session["status"] == "aborting") or stopped_exchange_saved()
+            user_requested_stop = (
+                _run_is_aborted(session_id, run_id)
+                or bool(session and session["status"] == "aborting")
+                or stopped_exchange_saved()
+            )
             session_store.finish(session_id, "idle", None if user_requested_stop else "client disconnected")
         raise
     except Exception as exc:
         session = session_store.get_session(session_id)
-        if stopped_exchange_saved() and session and session["status"] == "aborting":
+        if _run_is_aborted(session_id, run_id) or (
+            stopped_exchange_saved() and session and session["status"] == "aborting"
+        ):
             session_store.finish(session_id, "idle")
             return
         session_store.finish(session_id, "error", public_exception_message("Chat stream failed", exc))
         raise
+    finally:
+        _clear_run(session_id, run_id)
 
 
 @router.post("/chat", summary="Chat with the Agent via SSE")
@@ -226,12 +280,13 @@ def chat(req: ChatRequest) -> StreamingResponse:
     if not session_store.try_begin(session_id):
         raise HTTPException(status_code=409, detail="该会话正在生成回复，请先等待或停止生成。")
     clear_abort_flag(session_id)
+    run_id = _register_run(session_id)
 
     rows = session_store.get_messages(session_id, limit=agent_module.MAX_HISTORY_MESSAGES)
     history = _to_history(rows)
 
     return StreamingResponse(
-        _stream_and_persist(req.question, history, session_id),
+        _stream_and_persist(req.question, history, session_id, run_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -334,6 +389,7 @@ def abort_session(session_id: SessionIdPath, req: AbortSessionRequest | None = N
         return {"message": "No active generation for this session.", "status": "idle"}
 
     set_abort_flag(session_id)
+    active_run_id = _mark_active_run_aborted(session_id)
     if req and req.question:
         question = req.question.strip()
         if abort_state != "aborting" or not session_store.last_exchange_matches(
@@ -341,5 +397,8 @@ def abort_session(session_id: SessionIdPath, req: AbortSessionRequest | None = N
             question,
             answer_contains=STOPPED_MARKER,
         ):
-            session_store.append_exchange(session_id, question, _stopped_answer(req.partial_answer), final_status="aborting")
-    return {"message": "Abort requested.", "status": "aborting"}
+            final_status = "idle" if active_run_id else "aborting"
+            session_store.append_exchange(session_id, question, _stopped_answer(req.partial_answer), final_status=final_status)
+    elif active_run_id:
+        session_store.finish(session_id, "idle")
+    return {"message": "Abort requested.", "status": "idle" if active_run_id else "aborting"}

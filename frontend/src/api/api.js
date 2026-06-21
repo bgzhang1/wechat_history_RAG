@@ -188,7 +188,7 @@ function del(path, body, options = {}) {
  * Start an SSE chat stream.
  * @param {string} question
  * @param {string|null} sessionId
- * @param {object} callbacks – { onSession, onToolCall, onToolResult, onText, onDone, onError }
+ * @param {object} callbacks – { onSession, onToolCall, onToolResult, onThinking, onText, onDone, onError }
  * @returns {{ abort: Function }} controller to stop the stream client-side
  */
 export function chatSSE(question, sessionId, callbacks = {}) {
@@ -228,6 +228,7 @@ export function chatSSE(question, sessionId, callbacks = {}) {
           case 'session': callbacks.onSession?.(data); break
           case 'tool_call': callbacks.onToolCall?.(data); break
           case 'tool_result': callbacks.onToolResult?.(data); break
+          case 'thinking': callbacks.onThinking?.(data); break
           case 'text': callbacks.onText?.(data); break
           case 'done':
             terminalSeen = true
@@ -329,6 +330,9 @@ export function batchDeleteSessions(sessionIds, options = {}) {
 export function getSettings(options = {}) { return get('/settings', options) }
 export function updateSettings(data, options = {}) { return post('/settings', data, options) }
 export function resetSettings(options = {}) { return post('/settings/reset', null, options) }
+export function getModelOptions(target = 'chat', options = {}) {
+  return get(`/settings/models?${queryString({ target })}`, options)
+}
 
 // ─── 4. Stats ───────────────────────────────────────────────────────────────────
 
@@ -404,6 +408,10 @@ export function uploadFile(file, options = {}) {
 
 export function startIngest(params, options = {}) {
   return post('/ingest/start', params, options)
+}
+
+export function deleteIngestFile(params, options = {}) {
+  return post('/ingest/files/delete', params, options)
 }
 
 export function getIngestStatus(taskId, options = {}) {

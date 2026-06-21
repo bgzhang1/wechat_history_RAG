@@ -16,9 +16,19 @@
       @load-more="loadMoreSessions"
     />
     <div class="chat-main">
+      <div v-if="chatReadinessIssue" class="readiness-banner" :class="`readiness-${chatReadinessIssue.level}`">
+        <div class="readiness-content">
+          <strong>{{ chatReadinessIssue.title }}</strong>
+          <span>{{ chatReadinessIssue.message }}</span>
+        </div>
+        <button class="btn btn-ghost btn-sm" @click="goToReadinessAction">
+          {{ chatReadinessIssue.actionLabel }}
+        </button>
+      </div>
       <ChatMessages
         :messages="messages"
         :streaming-text="streamingText"
+        :streaming-thinking="streamingThinking"
         :tool-events="toolEvents"
         :is-generating="isGenerating"
         :loading="loadingMessages"
@@ -29,16 +39,30 @@
       />
       <ChatInput
         :is-generating="isGenerating"
-        :disabled="loadingMessages"
+        :disabled="loadingMessages || chatInputBlocked"
         @send="handleSend"
         @stop="handleStop"
       />
     </div>
+
+    <ConfirmDialog
+      v-if="confirmDialog"
+      :title="confirmDialog.title"
+      :message="confirmDialog.message"
+      :confirm-text="confirmDialog.confirmText"
+      :busy-text="confirmDialog.busyText"
+      :danger="confirmDialog.danger"
+      :busy="confirmBusy"
+      @confirm="confirmPendingAction"
+      @cancel="closeConfirmDialog"
+    />
   </div>
 </template>
 
 <script setup>
-import { ref, inject, onMounted, onUnmounted } from 'vue'
+import { computed, ref, inject, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
 import SessionSidebar from '../components/SessionSidebar.vue'
 import ChatMessages from '../components/ChatMessages.vue'
 import ChatInput from '../components/ChatInput.vue'
@@ -46,14 +70,17 @@ import {
   chatSSE, abortChat,
   getSessions, getMessages,
   renameSession, deleteSession, batchDeleteSessions,
+  healthCheck,
 } from '../api/api.js'
 
 const toast = inject('toast')
+const router = useRouter()
 
 const sessions = ref([])
 const activeSessionId = ref(null)
 const messages = ref([])
 const streamingText = ref('')
+const streamingThinking = ref('')
 const toolEvents = ref([])
 const isGenerating = ref(false)
 const loadingSessions = ref(false)
@@ -64,6 +91,10 @@ const sessionsTotal = ref(0)
 const messagesTotal = ref(0)
 const loadedMessagesCount = ref(0)
 const batchSelectionClearToken = ref(0)
+const confirmDialog = ref(null)
+const confirmBusy = ref(false)
+const chatHealth = ref(null)
+const chatHealthError = ref('')
 
 let currentStream = null
 let currentQuestion = ''
@@ -76,23 +107,93 @@ const activeSessionLoadControllers = new Set()
 const activeSessionMutationControllers = new Set()
 let activeMessagesController = null
 let activeOlderMessagesController = null
+let activeHealthController = null
 const SESSIONS_PAGE_SIZE = 100
 const MESSAGES_PAGE_SIZE = 500
 const STOP_ABORT_FALLBACK_MS = 1500
 const STOP_REQUEST_TIMEOUT_MS = 3000
 const MAX_STOP_PARTIAL_ANSWER_CHARS = 20000
-const DELETE_CONFIRM_PREFIX = '确定删除这个会话吗？'
-const BATCH_DELETE_CONFIRM_PREFIX = '确定删除选中的会话吗？'
+const chatInputBlocked = computed(() => chatHealth.value?.chat_model_configured === false)
+const chatReadinessIssue = computed(() => {
+  if (chatHealthError.value) {
+    return {
+      level: 'warning',
+      title: '状态检查失败',
+      message: chatHealthError.value,
+      actionLabel: '重新检查',
+      target: 'refresh',
+    }
+  }
+  const health = chatHealth.value
+  if (!health) return null
+  if (health.chat_model_configured === false) {
+    const missing = Array.isArray(health.chat_model_missing) && health.chat_model_missing.length
+      ? `缺少：${health.chat_model_missing.join('、')}`
+      : '对话模型尚未完整配置'
+    return {
+      level: 'error',
+      title: '对话暂不可用',
+      message: `${missing}。请先完成模型配置后再提问。`,
+      actionLabel: '打开配置',
+      target: 'settings',
+    }
+  }
+  if (health.has_data === false) {
+    return {
+      level: 'warning',
+      title: '还没有聊天记录',
+      message: '请先导入 WeFlow JSON，之后就可以按时间、人物和关键词提问。',
+      actionLabel: '去导入',
+      target: 'ingest',
+    }
+  }
+  return null
+})
 
-onMounted(() => { loadSessions() })
+onMounted(() => {
+  loadSessions()
+  loadChatReadiness()
+})
 
 onUnmounted(() => {
   componentDisposed = true
   abortListLoads()
   abortMessageLoads()
   abortSessionMutations()
+  activeHealthController?.abort()
+  activeHealthController = null
   cleanupActiveStream()
 })
+
+async function loadChatReadiness() {
+  activeHealthController?.abort()
+  const controller = new AbortController()
+  activeHealthController = controller
+  try {
+    const data = await healthCheck({ signal: controller.signal })
+    if (componentDisposed) return
+    chatHealth.value = data
+    chatHealthError.value = ''
+  } catch (e) {
+    if (componentDisposed) return
+    chatHealthError.value = `无法确认系统状态：${e.message}`
+  } finally {
+    if (activeHealthController === controller) activeHealthController = null
+  }
+}
+
+function goToReadinessAction() {
+  const issue = chatReadinessIssue.value
+  if (!issue) return
+  if (issue.target === 'refresh') {
+    loadChatReadiness()
+    return
+  }
+  router.push({
+    path: '/settings',
+    query: issue.target === 'settings' ? {} : { tab: issue.target },
+  })
+}
 
 function mergeSessions(existing, incoming) {
   const byId = new Map(existing.map(session => [session.session_id, session]))
@@ -208,18 +309,20 @@ function newChat() {
   messagesTotal.value = 0
   loadedMessagesCount.value = 0
   streamingText.value = ''
+  streamingThinking.value = ''
   toolEvents.value = []
 }
 
 async function handleSend(question) {
   const questionText = question.trim()
-  if (isGenerating.value || loadingMessages.value || !questionText) return
+  if (isGenerating.value || loadingMessages.value || chatInputBlocked.value || !questionText) return
 
   // Add user message immediately
   currentQuestion = questionText
   currentStreamSessionId = activeSessionId.value
   messages.value.push({ id: `local-user-${Date.now()}`, role: 'user', content: questionText, created_at: new Date().toISOString() })
   streamingText.value = ''
+  streamingThinking.value = ''
   toolEvents.value = []
   isGenerating.value = true
   const runId = ++activeStreamRun
@@ -238,6 +341,10 @@ async function handleSend(question) {
       if (runId !== activeStreamRun) return
       toolEvents.value.push({ type: 'result', name: data.name, summary: data.summary })
     },
+    onThinking(data) {
+      if (runId !== activeStreamRun) return
+      streamingThinking.value += data.chunk || ''
+    },
     onText(data) {
       if (runId !== activeStreamRun) return
       streamingText.value += data.chunk
@@ -250,11 +357,13 @@ async function handleSend(question) {
           id: `local-assistant-${Date.now()}`,
           role: 'assistant',
           content: data.answer,
+          reasoning_content: data.thinking || streamingThinking.value || '',
           created_at: new Date().toISOString(),
         })
         recordPersistedLocalExchange()
       }
       streamingText.value = ''
+      streamingThinking.value = ''
       toolEvents.value = []
       isGenerating.value = false
       currentStream = null
@@ -272,6 +381,7 @@ async function handleSend(question) {
         content: streamingText.value
           ? `${streamingText.value}\n\n*（生成失败：${message}）*`
           : `*（生成失败：${message}）*`,
+        reasoning_content: streamingThinking.value,
         created_at: new Date().toISOString(),
       })
       clearStreamState()
@@ -303,16 +413,20 @@ async function handleStop() {
       id: `local-stop-${Date.now()}`,
       role: 'assistant',
       content: streamingText.value + '\n\n*（已停止生成）*',
+      reasoning_content: streamingThinking.value,
       created_at: new Date().toISOString(),
     })
     streamingText.value = ''
+    streamingThinking.value = ''
   } else if (stoppedQuestion) {
     messages.value.push({
       id: `local-stop-${Date.now()}`,
       role: 'assistant',
       content: '*（已停止生成）*',
+      reasoning_content: streamingThinking.value,
       created_at: new Date().toISOString(),
     })
+    streamingThinking.value = ''
   }
   toolEvents.value = []
   const abortResult = await Promise.race([abortRequest, delay(STOP_REQUEST_TIMEOUT_MS)])
@@ -338,6 +452,7 @@ function recordPersistedLocalExchange() {
 
 function clearStreamState() {
   streamingText.value = ''
+  streamingThinking.value = ''
   toolEvents.value = []
   isGenerating.value = false
   currentStream = null
@@ -412,7 +527,18 @@ async function handleDelete(sessionId) {
     toast('请先停止当前生成', 'info')
     return
   }
-  if (!window.confirm(DELETE_CONFIRM_PREFIX)) return
+  confirmDialog.value = {
+    type: 'delete',
+    title: '删除这个会话？',
+    message: '删除后会移出侧边栏，会话消息也会从本地会话记录中删除。',
+    confirmText: '删除',
+    busyText: '删除中…',
+    danger: true,
+    sessionId,
+  }
+}
+
+async function performDelete(sessionId) {
   const controller = sessionMutationController()
   try {
     await deleteSession(sessionId, { signal: controller.signal })
@@ -434,7 +560,18 @@ async function handleBatchDelete(ids) {
     return
   }
   if (!ids.length) return
-  if (!window.confirm(`${BATCH_DELETE_CONFIRM_PREFIX}（${ids.length} 个）`)) return
+  confirmDialog.value = {
+    type: 'batch-delete',
+    title: '删除选中的会话？',
+    message: `将删除 ${ids.length} 个会话。生成中的会话会自动保留。`,
+    confirmText: '删除选中',
+    busyText: '删除中…',
+    danger: true,
+    ids,
+  }
+}
+
+async function performBatchDelete(ids) {
   const controller = sessionMutationController()
   try {
     const result = await batchDeleteSessions(ids, { signal: controller.signal })
@@ -452,6 +589,27 @@ async function handleBatchDelete(ids) {
     releaseSessionMutationController(controller)
   }
 }
+
+async function confirmPendingAction() {
+  if (!confirmDialog.value || confirmBusy.value) return
+  const pending = confirmDialog.value
+  confirmBusy.value = true
+  try {
+    if (pending.type === 'delete') {
+      await performDelete(pending.sessionId)
+    } else if (pending.type === 'batch-delete') {
+      await performBatchDelete(pending.ids || [])
+    }
+    confirmDialog.value = null
+  } finally {
+    confirmBusy.value = false
+  }
+}
+
+function closeConfirmDialog() {
+  if (confirmBusy.value) return
+  confirmDialog.value = null
+}
 </script>
 
 <style scoped>
@@ -468,6 +626,46 @@ async function handleBatchDelete(ids) {
   overflow: hidden;
   position: relative;
   min-width: 0;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--bg-secondary) 44%, transparent) 0%, transparent 28%),
+    var(--bg-primary);
+}
+
+.readiness-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--accent-yellow) 10%, var(--bg-elevated));
+  color: var(--text-primary);
+}
+
+.readiness-error {
+  background: color-mix(in srgb, var(--accent-red) 10%, var(--bg-elevated));
+}
+
+.readiness-content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.readiness-content strong {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+}
+
+.readiness-content span {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.readiness-banner .btn {
+  flex-shrink: 0;
 }
 
 @media (max-width: 768px) {
@@ -477,6 +675,12 @@ async function handleBatchDelete(ids) {
 
   .chat-main {
     min-height: 0;
+  }
+
+  .readiness-banner {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: var(--space-3) var(--space-4);
   }
 }
 </style>

@@ -18,7 +18,7 @@ from fastapi import APIRouter, Body, File, HTTPException, Query, UploadFile, Web
 from pydantic import BaseModel, Field, field_validator
 
 from core import store
-from core.llm import chat_config_status, embed_configured
+from core.llm import embed_configured, summary_config_status
 from core.parser import PARSER_VERSION, file_scope_for_path, is_weflow_export, stable_upload_scope
 
 from ..logging_utils import get_logger
@@ -51,6 +51,7 @@ TASK_LOG_VIEW_CHARS = 30000
 TASK_LOG_TAIL_CHARS = 2000
 TASK_PROGRESS_LOG_CHARS = 20000
 MAX_INGEST_TARGET_CHARS = 2048
+ETA_STALE_PROGRESS_SECONDS = _env_int("INGEST_ETA_STALE_SECONDS", 120, minimum=10)
 PROGRESS_PREFIX = "__INGEST_PROGRESS__ "
 
 _tasks: dict[str, dict[str, Any]] = {}
@@ -127,6 +128,24 @@ class IngestStartRequest(BaseModel):
         return _normalize_target_value(value)
 
 
+class IngestFileDeleteRequest(BaseModel):
+    upload_id: str | None = Field(
+        default=None,
+        max_length=MAX_INGEST_TARGET_CHARS,
+        description="ID returned by /api/ingest/upload",
+    )
+    file_id: str | None = Field(
+        default=None,
+        max_length=MAX_INGEST_TARGET_CHARS,
+        description="Relative file ID returned by /api/ingest/files",
+    )
+
+    @field_validator("upload_id", "file_id", mode="before")
+    @classmethod
+    def normalize_target(cls, value: object) -> object:
+        return _normalize_target_value(value)
+
+
 def _normalize_target_value(value: object) -> object:
     if value is None or not isinstance(value, str):
         return value
@@ -142,6 +161,7 @@ class TaskStatus(BaseModel):
     file_id: str | None = None
     mode: str = "incremental"
     error: str | None = None
+    error_info: dict[str, Any] | None = None
     can_cancel: bool = False
     progress: int = 0
     stage: str = "starting"
@@ -161,6 +181,7 @@ class TaskProgress(BaseModel):
     file_id: str | None = None
     mode: str = "incremental"
     error: str | None = None
+    error_info: dict[str, Any] | None = None
     can_cancel: bool = False
     log_tail: str = ""
 
@@ -243,11 +264,12 @@ def _task_snapshot(task_id: str, include_logs: bool = True) -> TaskStatus:
             file_id=task.get("file_id"),
             mode=str(task.get("mode") or "incremental"),
             error=_task_public_error(task),
+            error_info=_task_error_info(task),
             can_cancel=status in {"running", "cancel_requested"},
             progress=progress,
             stage=stage,
             message=_task_progress_message(task),
-            eta=_task_eta(task["created_at"], status, progress),
+            eta=_task_eta(task["created_at"], task["updated_at"], status, progress),
             log_tail=(
                 redact_text(
                     _task_log_tail(task, TASK_LOG_TAIL_CHARS),
@@ -337,6 +359,107 @@ def _task_public_error(task: dict[str, Any]) -> str | None:
     return redact_text(error, limit=500)
 
 
+def _task_error_info(task: dict[str, Any]) -> dict[str, Any] | None:
+    error = _task_public_error(task)
+    if not error:
+        return None
+    return_code = task.get("return_code")
+    info = _classify_ingest_error(
+        error,
+        mode=str(task.get("mode") or "incremental"),
+        return_code=return_code if isinstance(return_code, int) else None,
+    )
+    info["message"] = error
+    if return_code is not None:
+        info["return_code"] = return_code
+    return info
+
+
+def _classify_ingest_error(error: str, *, mode: str = "incremental", return_code: int | None = None) -> dict[str, Any]:
+    text = error.lower()
+    info: dict[str, Any] = {
+        "code": "INGEST_FAILED",
+        "type": "导入失败",
+        "action": "查看下方日志尾部，确认源文件、模型配置或索引环境后重试。",
+    }
+    if return_code is not None:
+        info["return_code"] = return_code
+
+    rules: list[tuple[tuple[str, ...], str, str, str]] = [
+        (
+            ("already", "正在运行", "上一", "冲突", "409"),
+            "INGEST_CONFLICT",
+            "任务冲突",
+            "已有导入任务占用队列，请等待完成或取消当前任务后再重试。",
+        ),
+        (
+            ("embed_base_url", "embed_api_key", "embed_model", "embedding model", "sqlite-vec"),
+            "EMBED_CONFIG_MISSING",
+            "向量配置缺失",
+            "在设置的高级设置中检查 Embedding Base URL、模型和线程批次；API Key 仍需在本地环境变量中配置。",
+        ),
+        (
+            ("summary_model", "summary", "摘要模型", "仅摘要"),
+            "SUMMARY_CONFIG_MISSING" if mode == "summary" else "SUMMARY_ERROR",
+            "摘要配置或生成失败",
+            "在设置中检查摘要模型、聊天 Base URL 和摘要线程批次；如果涉及 API Key，请检查本地环境变量。",
+        ),
+        (
+            ("rate limit", "429", "too many requests", "限流", "quota"),
+            "MODEL_RATE_LIMIT",
+            "模型限流",
+            "降低线程数或批次大小，等待额度恢复后重试。",
+        ),
+        (
+            ("timeout", "timed out", "超时", "readtimeout"),
+            "MODEL_TIMEOUT",
+            "模型请求超时",
+            "适当增大超时时间，或降低线程数、批次大小后重试。",
+        ),
+        (
+            ("badrequest", "bad request", "unprocessable", "400", "422", "rejected", "拒绝"),
+            "MODEL_REQUEST_REJECTED",
+            "模型请求被拒绝",
+            "检查 Base URL、模型名称和输入长度限制，必要时调小摘要或向量批次。",
+        ),
+        (
+            ("jsondecodeerror", "invalid json", "不是合法 json", "json decode", "expecting value"),
+            "INVALID_JSON",
+            "JSON 格式错误",
+            "确认文件是完整的 WeFlow JSON 导出，没有被截断或手工修改。",
+        ),
+        (
+            ("weflow", "微信聊天导出"),
+            "INVALID_WEFLOW_EXPORT",
+            "导出格式不匹配",
+            "请使用 WeFlow 导出的微信聊天 JSON 原文件再导入。",
+        ),
+        (
+            ("permission", "access is denied", "permission denied", "权限"),
+            "FILE_PERMISSION",
+            "文件权限问题",
+            "确认后端进程可以读取该 JSON 文件，并且文件没有被其他程序锁定。",
+        ),
+        (
+            ("memory", "out of memory", "no space", "resource", "磁盘", "空间"),
+            "RESOURCE_EXHAUSTED",
+            "本机资源不足",
+            "释放内存或磁盘空间后重试；大文件可先降低并发和批次大小。",
+        ),
+        (
+            ("sqlite", "vector", "向量索引", "vec0", "database"),
+            "VECTOR_INDEX_ERROR",
+            "索引或数据库错误",
+            "检查数据库健康状态和 sqlite-vec 可用性，必要时重建索引。",
+        ),
+    ]
+    for keywords, code, type_label, action in rules:
+        if any(keyword in text for keyword in keywords):
+            info.update({"code": code, "type": type_label, "action": action})
+            return info
+    return info
+
+
 def _task_failure_error(task_id: str, return_code: int) -> str:
     fallback = f"ingest exited with code {return_code}"
     detail = _task_failure_detail(task_id)
@@ -400,19 +523,33 @@ def _parse_progress_event(text: str) -> dict[str, Any] | None:
     }
 
 
+def _parse_task_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _estimate_eta(created_at: str, progress: int) -> int | None:
     if progress <= 0 or progress >= 100:
         return None
-    try:
-        started = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-    except ValueError:
+    started = _parse_task_time(created_at)
+    if started is None:
         return None
     elapsed = max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
     return int(elapsed * (100 - progress) / progress)
 
 
-def _task_eta(created_at: str, status: str, progress: int) -> int | None:
+def _task_eta(created_at: str, updated_at: str, status: str, progress: int) -> int | None:
     if status in {"completed", "cancelled", "error"}:
+        return None
+    updated = _parse_task_time(updated_at)
+    if updated is None:
+        return None
+    if (datetime.now(timezone.utc) - updated).total_seconds() > ETA_STALE_PROGRESS_SECONDS:
         return None
     return _estimate_eta(created_at, progress)
 
@@ -432,11 +569,12 @@ def _task_progress(task_id: str) -> TaskProgress:
             progress=progress,
             stage=stage,
             message=_task_progress_message(task),
-            eta=_task_eta(task["created_at"], status, progress),
+            eta=_task_eta(task["created_at"], task["updated_at"], status, progress),
             updated_at=task["updated_at"],
             file_id=task.get("file_id"),
             mode=str(task.get("mode") or "incremental"),
             error=_task_public_error(task),
+            error_info=_task_error_info(task),
             can_cancel=status in {"running", "cancel_requested"},
             log_tail=log_tail,
         )
@@ -462,6 +600,14 @@ def _create_task_or_raise(resolved_path: Path, mode: str) -> str:
         }
     _prune_tasks()
     return task_id
+
+
+def _live_task_for_file_id(file_id: str) -> str | None:
+    with _tasks_lock:
+        for task_id, task in _tasks.items():
+            if task.get("file_id") == file_id and task.get("status") in {"running", "cancel_requested"}:
+                return task_id
+    return None
 
 
 def _prune_tasks() -> None:
@@ -652,7 +798,7 @@ def _summary_available() -> bool:
     if not summary_model:
         return False
     try:
-        return bool(chat_config_status(summary_model).get("configured"))
+        return bool(summary_config_status(summary_model).get("configured"))
     except Exception:
         return False
 
@@ -791,7 +937,7 @@ def _run_ingest_task(task_id: str, file_path: Path, mode: str) -> None:
         return
 
     if not _process_lock.acquire(blocking=False):
-        _task_update(task_id, status="error", error="已有导入任务正在运行。")
+        _task_update(task_id, status="error", error="已有导入任务正在运行。", return_code=None)
         logger.error(
             "Failed to start ingest task because another task is running",
             extra={"task_id": task_id, "file_id": _file_id_for(file_path), "mode": mode},
@@ -838,13 +984,13 @@ def _run_ingest_task(task_id: str, file_path: Path, mode: str) -> None:
             _task_update(task_id, status="cancelled", error=None)
             logger.info("Ingest task cancelled", extra={"task_id": task_id})
         elif return_code == 0:
-            _task_update(task_id, status="completed", error=None)
+            _task_update(task_id, status="completed", error=None, return_code=0)
             logger.info("Ingest task completed", extra={"task_id": task_id})
         else:
-            _task_update(task_id, status="error", error=_task_failure_error(task_id, return_code))
+            _task_update(task_id, status="error", error=_task_failure_error(task_id, return_code), return_code=return_code)
             logger.error("Ingest task failed", extra={"task_id": task_id, "return_code": return_code})
     except BaseException as exc:
-        _task_update(task_id, status="error", error=public_exception_message("Ingest task failed", exc))
+        _task_update(task_id, status="error", error=public_exception_message("Ingest task failed", exc), return_code=None)
         logger.error(
             "Ingest task crashed",
             exc_info=(type(exc), exc, exc.__traceback__),
@@ -1053,6 +1199,46 @@ def list_files(
     return {"total_count": len(files), "returned": len(items), "offset": safe_offset, "items": items}
 
 
+@router.post("/files/delete", summary="Delete a local ingest source JSON file")
+def delete_file(req: IngestFileDeleteRequest) -> dict[str, Any]:
+    provided_targets = [
+        name
+        for name, value in (
+            ("upload_id", req.upload_id),
+            ("file_id", req.file_id),
+        )
+        if value
+    ]
+    if len(provided_targets) != 1:
+        raise HTTPException(status_code=400, detail="请且只提供 upload_id 或 file_id 中的一项。")
+
+    if req.upload_id is not None:
+        resolved_path = _resolve_upload(req.upload_id)
+    elif req.file_id is not None:
+        resolved_path = _resolve_local_file_id(req.file_id)
+    else:
+        raise HTTPException(status_code=400, detail="请且只提供 upload_id 或 file_id 中的一项。")
+
+    file_id = _file_id_for(resolved_path)
+    live_task_id = _live_task_for_file_id(file_id)
+    if live_task_id:
+        raise HTTPException(status_code=409, detail="该文件正在导入，请等待完成或取消任务后再删除。")
+
+    try:
+        meta_path = _upload_meta_path(resolved_path)
+        resolved_path.unlink()
+        if resolved_path.parent.resolve() == UPLOAD_ROOT.resolve():
+            meta_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="删除文件失败，请检查文件是否被占用或目录权限。") from exc
+
+    logger.info("Ingest source file deleted", extra={"file_id": file_id})
+    return {
+        "file_id": file_id,
+        "message": "源 JSON 文件已删除；已入库的聊天记录不会自动删除。",
+    }
+
+
 @router.post("/upload", response_model=UploadResponse, summary="Upload chat history JSON")
 def upload_file(file: UploadFile = File(...)) -> UploadResponse:
     filename = _clean_display_filename(file.filename or "upload.json")
@@ -1187,7 +1373,7 @@ def start_ingest(
         if mode == "summary" and not _summary_available():
             raise HTTPException(
                 status_code=400,
-                detail="仅摘要构建要求已配置 SUMMARY_MODEL，并配置可用的 CHAT_BASE_URL 和 CHAT_API_KEY。",
+                detail="仅摘要构建要求已配置 SUMMARY_MODEL，并配置可用的摘要 Base URL/API Key；未单独设置时会继承对话配置。",
             )
         if mode in {"embeddings", "vector"} and not _embedding_available():
             raise HTTPException(
@@ -1238,9 +1424,9 @@ def cancel_task(task_id: str) -> TaskStatus:
         return_code = process.poll()
         if return_code is not None:
             if return_code == 0:
-                _task_update(task_id, status="completed", error=None, process=None)
+                _task_update(task_id, status="completed", error=None, return_code=0, process=None)
             else:
-                _task_update(task_id, status="error", error=_task_failure_error(task_id, return_code), process=None)
+                _task_update(task_id, status="error", error=_task_failure_error(task_id, return_code), return_code=return_code, process=None)
         elif _terminate_process(process):
             _task_update(task_id, status="cancelled", error=None, process=None)
 

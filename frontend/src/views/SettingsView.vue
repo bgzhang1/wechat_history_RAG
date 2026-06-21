@@ -69,21 +69,21 @@ function setActiveTab(tab) {
 .settings-layout {
   height: 100%;
   overflow-y: auto;
-  padding: var(--space-6) var(--space-8);
+  padding: var(--space-8);
 }
 
 .settings-container {
-  max-width: 900px;
+  max-width: 1040px;
   margin: 0 auto;
 }
 
 .settings-header {
-  margin-bottom: var(--space-6);
+  margin-bottom: var(--space-5);
 }
 
 .settings-title {
-  font-size: var(--text-2xl);
-  font-weight: 700;
+  font-size: 1.85rem;
+  font-weight: 760;
   background: var(--gradient-brand);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -94,6 +94,9 @@ function setActiveTab(tab) {
 .tabs {
   margin-bottom: var(--space-6);
   flex-wrap: wrap;
+  width: fit-content;
+  max-width: 100%;
+  box-shadow: var(--shadow-sm);
 }
 
 .tab-content {
@@ -112,6 +115,7 @@ function setActiveTab(tab) {
   .tabs {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
   }
 
   .tab {

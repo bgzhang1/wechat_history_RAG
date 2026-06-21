@@ -284,7 +284,7 @@ function formatDetailValue(value) {
 
 .detail-chip {
   padding: 1px 6px;
-  background: rgba(255, 255, 255, 0.04);
+  background: color-mix(in srgb, var(--text-muted) 10%, transparent);
   border-radius: var(--radius-sm);
   color: var(--text-muted);
   max-width: 100%;
@@ -294,7 +294,7 @@ function formatDetailValue(value) {
 .log-traceback {
   margin-top: var(--space-2);
   padding: var(--space-3);
-  background: rgba(0, 0, 0, 0.25);
+  background: color-mix(in srgb, var(--bg-tertiary) 70%, transparent);
   border-radius: var(--radius-sm);
   color: var(--accent-red);
   white-space: pre-wrap;

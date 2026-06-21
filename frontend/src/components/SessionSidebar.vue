@@ -50,7 +50,7 @@
             <span
               v-if="sessionStatusLabel(s)"
               :class="['session-status', sessionStatusClass(s)]"
-              :title="s.last_error || sessionStatusLabel(s)"
+              :title="sessionStatusTitle(s)"
             >
               {{ sessionStatusLabel(s) }}
             </span>
@@ -199,6 +199,18 @@ function sessionStatusClass(session) {
   return ''
 }
 
+function sessionStatusTitle(session) {
+  if (session.status !== 'error') return sessionStatusLabel(session)
+  const error = shortErrorText(session.last_error)
+  return error ? `失败：${error}` : '失败'
+}
+
+function shortErrorText(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  return text.length > 160 ? `${text.slice(0, 159).trimEnd()}…` : text
+}
+
 function formatTime(iso) {
   if (!iso) return ''
   const d = new Date(iso)
@@ -214,12 +226,12 @@ function formatTime(iso) {
 
 <style scoped>
 .sidebar {
-  width: var(--sidebar-width);
+  width: 312px;
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: rgba(17, 24, 39, 0.6);
-  backdrop-filter: blur(16px);
+  background: color-mix(in srgb, var(--bg-secondary) 86%, transparent);
+  backdrop-filter: blur(20px);
   border-right: 1px solid var(--border-subtle);
   flex-shrink: 0;
 }
@@ -229,6 +241,7 @@ function formatTime(iso) {
   display: flex;
   gap: var(--space-2);
   border-bottom: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--bg-secondary) 72%, transparent);
 }
 
 .btn-new-chat {
@@ -238,7 +251,7 @@ function formatTime(iso) {
 .session-list {
   flex: 1;
   overflow-y: auto;
-  padding: var(--space-2);
+  padding: var(--space-3);
 }
 
 .session-empty {
@@ -247,7 +260,7 @@ function formatTime(iso) {
 
 .session-item {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--space-2);
   padding: var(--space-3);
   border-radius: var(--radius-md);
@@ -255,26 +268,45 @@ function formatTime(iso) {
   transition: all var(--transition-fast);
   animation: fadeIn var(--transition-normal) ease-out;
   position: relative;
+  border: 1px solid transparent;
+}
+
+.session-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: var(--space-3);
+  bottom: var(--space-3);
+  width: 3px;
+  border-radius: var(--radius-full);
+  background: transparent;
 }
 
 .session-checkbox {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
+  padding-top: 2px;
 }
 
 .session-item:hover {
-  background: var(--surface-glass-hover);
+  background: color-mix(in srgb, var(--bg-elevated) 66%, transparent);
+  border-color: var(--border-subtle);
 }
 
 .session-item.active {
-  background: var(--surface-glass-active);
-  border: 1px solid var(--border-default);
+  background: color-mix(in srgb, var(--accent-blue) 9%, var(--bg-elevated));
+  border-color: color-mix(in srgb, var(--accent-blue) 20%, var(--border-default));
+  box-shadow: var(--shadow-sm);
+}
+
+.session-item.active::before {
+  background: var(--gradient-brand);
 }
 
 .session-checkbox input {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   cursor: pointer;
   accent-color: var(--accent-blue);
   flex-shrink: 0;
@@ -287,7 +319,7 @@ function formatTime(iso) {
 
 .session-title {
   font-size: var(--text-sm);
-  font-weight: 500;
+  font-weight: 610;
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
@@ -304,7 +336,7 @@ function formatTime(iso) {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
-  margin-top: 2px;
+  margin-top: 4px;
   min-width: 0;
 }
 
@@ -338,7 +370,8 @@ function formatTime(iso) {
   flex-shrink: 0;
 }
 
-.session-item:hover .session-actions {
+.session-item:hover .session-actions,
+.session-item.active .session-actions {
   opacity: 1;
 }
 
@@ -381,14 +414,14 @@ function formatTime(iso) {
 
 .load-more {
   width: 100%;
-  margin-top: var(--space-2);
+  margin-top: var(--space-3);
   justify-content: center;
 }
 
 @media (max-width: 768px) {
   .sidebar {
     width: 100%;
-    height: 220px;
+    height: 188px;
     border-right: none;
     border-bottom: 1px solid var(--border-subtle);
   }

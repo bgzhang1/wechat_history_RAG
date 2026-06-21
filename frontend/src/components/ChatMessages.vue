@@ -50,7 +50,16 @@
         <div class="message-content">
           <div class="message-role">{{ msg.role === 'user' ? '你' : 'AI 助手' }}</div>
           <div v-if="msg.role === 'user'" class="message-text">{{ msg.content }}</div>
-          <div v-else class="message-text markdown-body" v-html="renderMarkdown(msg.content)"></div>
+          <template v-else>
+            <details v-if="hasThinking(msg.reasoning_content)" class="thinking-panel">
+              <summary>
+                <span class="thinking-dot"></span>
+                <span>思考过程</span>
+              </summary>
+              <div class="thinking-content markdown-body" v-html="renderMarkdown(msg.reasoning_content)"></div>
+            </details>
+            <div class="message-text markdown-body" v-html="renderMarkdown(msg.content)"></div>
+          </template>
         </div>
       </div>
 
@@ -98,6 +107,13 @@
         </div>
         <div class="message-content">
           <div class="message-role">AI 助手</div>
+          <details v-if="hasThinking(streamingThinking)" class="thinking-panel">
+            <summary>
+              <span class="thinking-dot thinking-active"></span>
+              <span>思考过程</span>
+            </summary>
+            <div class="thinking-content markdown-body" v-html="renderMarkdown(streamingThinking)"></div>
+          </details>
           <div class="message-text markdown-body" v-html="renderMarkdown(streamingText)"></div>
           <span class="typing-cursor"></span>
         </div>
@@ -147,6 +163,7 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
 const props = defineProps({
   messages: { type: Array, default: () => [] },
   streamingText: { type: String, default: '' },
+  streamingThinking: { type: String, default: '' },
   toolEvents: { type: Array, default: () => [] },
   isGenerating: { type: Boolean, default: false },
   loading: { type: Boolean, default: false },
@@ -167,6 +184,10 @@ const TOOL_ERROR_PREFIXES = ['错误：', '工具执行错误：', '工具参数
 function renderMarkdown(text) {
   if (!text) return ''
   return DOMPurify.sanitize(marked.parse(text), MARKDOWN_SANITIZE_CONFIG)
+}
+
+function hasThinking(value) {
+  return String(value || '').trim().length > 0
 }
 
 function normalizeToolText(value) {
@@ -264,6 +285,7 @@ watch(
   },
 )
 watch(() => props.streamingText, scrollToBottom)
+watch(() => props.streamingThinking, scrollToBottom)
 watch(() => props.toolEvents.length, scrollToBottom)
 watch(
   () => props.loadingOlder,
@@ -279,7 +301,7 @@ watch(
 .messages-area {
   flex: 1;
   overflow-y: auto;
-  padding: var(--space-6);
+  padding: var(--space-6) var(--space-8);
 }
 
 .messages-loading {
@@ -299,71 +321,105 @@ watch(
   justify-content: center;
   height: 100%;
   gap: var(--space-4);
+  max-width: 860px;
+  margin: 0 auto;
+  padding-bottom: 8vh;
   animation: fadeIn 0.6s ease-out;
 }
 
 .welcome-icon {
-  width: 80px;
-  height: 80px;
+  width: 72px;
+  height: 72px;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--surface-glass);
-  border-radius: var(--radius-xl);
+  background: color-mix(in srgb, var(--bg-elevated) 82%, transparent);
+  border-radius: var(--radius-lg);
   border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-md);
 }
 
 .welcome-title {
-  font-size: var(--text-2xl);
-  font-weight: 700;
+  font-size: 2.25rem;
+  font-weight: 760;
   background: var(--gradient-brand);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
+  line-height: 1.12;
+  text-align: center;
 }
 
 .welcome-desc {
   color: var(--text-secondary);
-  font-size: var(--text-base);
-  max-width: 400px;
+  font-size: 0.95rem;
+  max-width: 520px;
   text-align: center;
 }
 
 .welcome-suggestions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  justify-content: center;
-  margin-top: var(--space-4);
-  max-width: 560px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  justify-content: stretch;
+  margin-top: var(--space-5);
+  width: min(760px, 100%);
 }
 
 .suggestion-chip {
-  padding: var(--space-2) var(--space-4);
-  border-radius: var(--radius-full);
-  background: var(--surface-glass);
+  min-height: 74px;
+  padding: var(--space-4);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-elevated) 78%, transparent);
   border: 1px solid var(--border-default);
-  color: var(--text-secondary);
+  color: var(--text-primary);
   font-size: var(--text-sm);
+  font-weight: 560;
+  line-height: 1.5;
   cursor: pointer;
   transition: all var(--transition-fast);
   font-family: var(--font-sans);
+  text-align: left;
+  box-shadow: var(--shadow-sm);
+  position: relative;
+  overflow: hidden;
+}
+
+.suggestion-chip::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--gradient-brand);
+  opacity: 0.78;
 }
 
 .suggestion-chip:hover {
-  background: var(--surface-glass-hover);
+  background: var(--bg-elevated);
   color: var(--text-primary);
-  border-color: rgba(59, 130, 246, 0.3);
-  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent-blue) 32%, var(--border-default));
+  box-shadow: var(--shadow-md);
+  transform: translateY(-2px);
+}
+
+:global(.dark) .suggestion-chip {
+  background: #171f2b;
+  border-color: rgba(255, 255, 255, 0.12);
+  color: var(--text-primary);
+}
+
+:global(.dark) .suggestion-chip:hover {
+  background: #1d2633;
 }
 
 /* Messages */
 .messages-list {
-  max-width: 800px;
+  max-width: 860px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--space-5);
+  padding-bottom: var(--space-4);
 }
 
 .load-older {
@@ -377,9 +433,22 @@ watch(
   animation: fadeIn var(--transition-normal) ease-out;
 }
 
+.message-user {
+  justify-content: flex-end;
+}
+
+.message-user .message-avatar {
+  order: 2;
+}
+
+.message-user .message-content {
+  flex: 0 1 auto;
+  max-width: min(78%, 620px);
+}
+
 .message-avatar {
-  width: 36px;
-  height: 36px;
+  width: 34px;
+  height: 34px;
   border-radius: var(--radius-md);
   display: flex;
   align-items: center;
@@ -388,13 +457,14 @@ watch(
 }
 
 .message-user .message-avatar {
-  background: var(--surface-glass-active);
+  background: color-mix(in srgb, var(--accent-blue) 13%, transparent);
   color: var(--accent-blue);
 }
 
 .message-assistant .message-avatar {
-  background: linear-gradient(135deg, rgba(59,130,246,0.15), rgba(139,92,246,0.15));
-  color: var(--accent-purple);
+  background: color-mix(in srgb, var(--bg-elevated) 78%, transparent);
+  border: 1px solid var(--border-subtle);
+  color: var(--accent-blue);
 }
 
 .message-content {
@@ -419,10 +489,72 @@ watch(
 }
 
 .message-user .message-text {
-  background: var(--surface-glass);
-  border: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--accent-blue) 10%, var(--bg-elevated));
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 20%, var(--border-subtle));
   border-radius: var(--radius-lg);
   padding: var(--space-3) var(--space-4);
+  box-shadow: var(--shadow-sm);
+}
+
+.thinking-panel {
+  margin-bottom: var(--space-2);
+  max-width: min(100%, 680px);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-tertiary) 56%, transparent);
+  overflow: hidden;
+}
+
+.thinking-panel summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: 0 var(--space-3);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: var(--text-xs);
+  font-weight: 680;
+  list-style: none;
+}
+
+.thinking-panel summary::-webkit-details-marker {
+  display: none;
+}
+
+.thinking-panel summary::after {
+  content: '展开';
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: 560;
+}
+
+.thinking-panel[open] summary::after {
+  content: '收起';
+}
+
+.thinking-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--accent-blue);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent-blue) 12%, transparent);
+}
+
+.thinking-active {
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}
+
+.thinking-content {
+  padding: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.65;
+  max-height: 280px;
+  overflow: auto;
+  overflow-wrap: anywhere;
 }
 
 /* Tool events */
@@ -513,7 +645,7 @@ watch(
 .tool-args {
   margin-top: var(--space-1);
   padding: var(--space-2) var(--space-3);
-  background: rgba(0,0,0,0.2);
+  background: color-mix(in srgb, var(--bg-tertiary) 74%, transparent);
   border-radius: var(--radius-sm);
   color: var(--text-muted);
   max-width: min(100%, 560px);
@@ -574,8 +706,12 @@ watch(
     padding-top: var(--space-6);
   }
 
+  .welcome-title {
+    font-size: 1.65rem;
+  }
+
   .welcome-suggestions {
-    flex-direction: column;
+    grid-template-columns: 1fr;
     width: 100%;
   }
 

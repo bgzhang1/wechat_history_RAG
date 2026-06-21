@@ -115,7 +115,7 @@ wechat_agent/
 ## 5. 配置项
 
 配置通过 `.env` 读取。详情也可参考后端 `/api/settings` 的动态配置项。
-设置页会返回当前生效配置和只读 `available_tools` 工具清单，但持久化文件只保存非密钥运行时覆盖值；当 `chat_model` 或 `chat_timeout` 与 `.env` / 环境变量一致时不会写成覆盖值，因此后续修改 `.env` 后重启仍会生效。
+设置页会返回当前生效配置和只读 `available_tools` 工具清单，但持久化文件只保存非密钥运行时覆盖值；当 `chat_model`、`summary_model` 或 `chat_timeout` 与 `.env` / 环境变量一致时不会写成覆盖值，因此后续修改 `.env` 后重启仍会生效。
 
 ### 5.1 主聊天模型
 | 变量 | 必填 | 默认值 | 说明 |

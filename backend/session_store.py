@@ -100,6 +100,7 @@ def init_schema(conn: sqlite3.Connection | None = None) -> None:
               session_id TEXT NOT NULL,
               role       TEXT NOT NULL,
               content    TEXT NOT NULL,
+              reasoning_content TEXT,
               created_at TEXT NOT NULL,
               FOREIGN KEY(session_id) REFERENCES backend_chat_sessions(session_id)
                 ON DELETE CASCADE
@@ -111,6 +112,12 @@ def init_schema(conn: sqlite3.Connection | None = None) -> None:
               ON backend_chat_sessions(updated_at);
             """
         )
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(backend_chat_messages)").fetchall()
+        }
+        if "reasoning_content" not in columns:
+            conn.execute("ALTER TABLE backend_chat_messages ADD COLUMN reasoning_content TEXT")
         conn.execute(
             """
             UPDATE backend_chat_sessions
@@ -240,7 +247,7 @@ def get_messages(session_id: str, limit: int | None = None, offset: int = 0) -> 
         if limit is None:
             rows = db().execute(
                 """
-                SELECT id, role, content, created_at
+                SELECT id, role, content, reasoning_content, created_at
                 FROM backend_chat_messages
                 WHERE session_id = ?
                 ORDER BY id
@@ -254,7 +261,7 @@ def get_messages(session_id: str, limit: int | None = None, offset: int = 0) -> 
             safe_offset = _safe_int(offset, 0, minimum=0)
             rows = db().execute(
                 """
-                SELECT id, role, content, created_at
+                SELECT id, role, content, reasoning_content, created_at
                 FROM (
                   SELECT id, role, content, created_at
                   FROM backend_chat_messages
@@ -312,7 +319,13 @@ def last_exchange_matches(
     return not (answer_contains is not None and answer_contains not in assistant_row["content"])
 
 
-def append_exchange(session_id: str, question: str, answer: str, final_status: SessionStatus = "idle") -> None:
+def append_exchange(
+    session_id: str,
+    question: str,
+    answer: str,
+    final_status: SessionStatus = "idle",
+    answer_reasoning: str | None = None,
+) -> None:
     now = _now()
     with _lock:
         get_or_create_session(session_id)
@@ -320,12 +333,12 @@ def append_exchange(session_id: str, question: str, answer: str, final_status: S
         with conn:
             conn.executemany(
                 """
-                INSERT INTO backend_chat_messages (session_id, role, content, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO backend_chat_messages (session_id, role, content, reasoning_content, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 [
-                    (session_id, "user", question, now),
-                    (session_id, "assistant", answer, now),
+                    (session_id, "user", question, None, now),
+                    (session_id, "assistant", answer, (answer_reasoning or "").strip() or None, now),
                 ],
             )
             conn.execute(

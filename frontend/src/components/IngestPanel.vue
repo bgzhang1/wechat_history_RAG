@@ -55,9 +55,10 @@
           <button
             class="btn btn-primary btn-sm"
             :disabled="ingestStartLocked || hasBusyFile || pendingFiles.length === 0"
+            title="处理未导入、文件已变化或需要补齐索引的 JSON"
             @click="startBatchImport"
           >
-            {{ batchRunning ? '批量导入中…' : `导入待处理 ${pendingFiles.length}` }}
+            {{ batchActionLabel }}
           </button>
           <button id="btn-refresh-files" class="btn btn-ghost btn-sm" :disabled="loadingFiles" @click="loadFiles">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
@@ -68,13 +69,13 @@
 
       <div v-if="batchRunning" class="batch-progress glass-card">
         <div class="progress-info">
-          <span class="text-xs text-muted">批量导入 {{ batchDone }}/{{ batchTotal }} · {{ batchCurrentName }}</span>
+          <span class="text-xs text-muted">批量处理 {{ batchDone }}/{{ batchTotal }} · {{ batchCurrentName }}</span>
           <span class="text-xs font-mono">{{ batchPercent }}%</span>
         </div>
         <div
           class="progress-bar"
           role="progressbar"
-          aria-label="批量导入进度"
+          aria-label="批量处理进度"
           aria-valuemin="0"
           aria-valuemax="100"
           :aria-valuenow="batchPercent"
@@ -168,6 +169,14 @@
             >
               {{ importButtonLabel(f) }}
             </button>
+            <button
+              class="btn btn-danger btn-sm delete-file-btn"
+              :disabled="ingestStartLocked || isFileBusy(f) || deletingFileIds.has(fileKey(f))"
+              title="删除这个源 JSON 文件；不会删除已入库聊天记录"
+              @click="openDeleteFileConfirm(f)"
+            >
+              {{ deletingFileIds.has(fileKey(f)) ? '删除中…' : '删除' }}
+            </button>
           </div>
         </div>
       </div>
@@ -234,7 +243,19 @@
           </div>
 
           <div v-if="task.error" class="task-error text-sm">
-            导入失败：{{ task.error }}
+            <div class="task-error-title">
+              <span>导入失败：{{ taskErrorTitle(task) }}</span>
+              <span v-if="taskErrorCode(task)" class="task-error-code">{{ taskErrorCode(task) }}</span>
+            </div>
+            <div v-if="taskErrorAction(task)" class="task-error-action">
+              建议处理：{{ taskErrorAction(task) }}
+            </div>
+            <div v-if="taskErrorReturnCode(task) != null" class="task-error-meta">
+              子进程返回码：{{ taskErrorReturnCode(task) }}
+            </div>
+            <div class="task-error-message">
+              原始信息：{{ task.error }}
+            </div>
           </div>
 
           <div v-if="task.can_cancel && isTaskLive(task)" class="task-actions">
@@ -258,12 +279,25 @@
       </div>
     </div>
   </div>
+
+  <ConfirmDialog
+    v-if="deleteFileConfirm"
+    title="删除这个源 JSON？"
+    :message="deleteFileConfirm.message"
+    confirm-text="删除文件"
+    busy-text="删除中…"
+    :busy="deleteFileBusy"
+    danger
+    @confirm="confirmDeleteFile"
+    @cancel="closeDeleteFileConfirm"
+  />
 </template>
 
 <script setup>
 import { ref, reactive, onMounted, onUnmounted, inject, computed } from 'vue'
+import ConfirmDialog from './ConfirmDialog.vue'
 import {
-  getAllIngestFiles, uploadFile, startIngest,
+  getAllIngestFiles, uploadFile, startIngest, deleteIngestFile,
   getIngestTasks, getIngestStatus, cancelIngest, connectIngestWS,
   healthCheck,
 } from '../api/api.js'
@@ -312,6 +346,9 @@ const wsConnections = {}
 const selectedModes = reactive({})
 const startingFileIds = ref(new Set())
 const cancellingTaskIds = ref(new Set())
+const deletingFileIds = ref(new Set())
+const deleteFileConfirm = ref(null)
+const deleteFileBusy = ref(false)
 const refreshingLiveState = ref(false)
 let liveRefreshTimer = null
 let componentDisposed = false
@@ -328,6 +365,7 @@ const activeTaskLoadControllers = new Set()
 const activeTaskStatusControllers = new Set()
 const activeTaskStartControllers = new Set()
 const activeTaskCancelControllers = new Set()
+const activeFileDeleteControllers = new Set()
 const activeHealthControllers = new Set()
 
 const hasRunningTask = computed(() => tasks.value.some(isTaskLive))
@@ -338,6 +376,9 @@ const ingestStartLocked = computed(
 )
 const uploadDisabled = computed(() => uploading.value || batchRunning.value)
 const pendingFiles = computed(() => files.value.filter(canBatchImport))
+const batchActionLabel = computed(() => (
+  batchRunning.value ? '批量处理中…' : `处理待更新 ${pendingFiles.value.length}`
+))
 const indexDiagnostics = computed(() => {
   const checks = Array.isArray(ingestHealth.value?.checks) ? ingestHealth.value.checks : []
   return checks.filter(
@@ -366,6 +407,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   componentDisposed = true
+  deleteFileConfirm.value = null
   activeUploadController?.abort()
   activeUploadController = null
   activeFileLoadControllers.forEach(controller => controller.abort())
@@ -378,6 +420,8 @@ onUnmounted(() => {
   activeTaskStartControllers.clear()
   activeTaskCancelControllers.forEach(controller => controller.abort())
   activeTaskCancelControllers.clear()
+  activeFileDeleteControllers.forEach(controller => controller.abort())
+  activeFileDeleteControllers.clear()
   activeHealthControllers.forEach(controller => controller.abort())
   activeHealthControllers.clear()
   if (liveRefreshTimer) window.clearInterval(liveRefreshTimer)
@@ -653,6 +697,7 @@ function rememberStartedTask(file, result, mode) {
     file_id: file.file_id,
     mode: startedMode,
     error: null,
+    error_info: null,
     can_cancel: true,
     progress: 0,
     stage: 'starting',
@@ -704,7 +749,7 @@ async function startBatchImport() {
         batchCurrentTaskId.value = result.task_id
         const status = await waitForTask(result.task_id)
         if (status.status !== 'completed') {
-          failures.push(`${batchCurrentName.value}: ${status.error || taskStatusLabel(status.status)}`)
+          failures.push(`${batchCurrentName.value}: ${taskFailureSummary(status)}`)
           if (status.status === 'cancelled') break
         }
       } catch (e) {
@@ -721,9 +766,9 @@ async function startBatchImport() {
 
     if (componentDisposed) return
     if (failures.length > 0) {
-      toast(`批量导入完成，失败 ${failures.length} 个：${formatUploadErrors(failures)}`, 'error')
+      toast(`批量处理完成，失败 ${failures.length} 个：${formatUploadErrors(failures)}`, 'error')
     } else {
-      toast(`批量导入完成，共 ${queue.length} 个文件`, 'success')
+      toast(`批量处理完成，共 ${queue.length} 个文件`, 'success')
     }
   } finally {
     if (!componentDisposed) {
@@ -742,7 +787,7 @@ async function waitForTask(taskId) {
   while (true) {
     await delay(TASK_POLL_MS)
     if (componentDisposed) {
-      const err = new Error('批量导入页面已关闭')
+      const err = new Error('批量处理页面已关闭')
       err.batchStopped = true
       throw err
     }
@@ -775,7 +820,7 @@ async function waitForTask(taskId) {
 }
 
 function batchStoppedError() {
-  const err = new Error('批量导入页面已关闭')
+  const err = new Error('批量处理页面已关闭')
   err.batchStopped = true
   return err
 }
@@ -807,6 +852,52 @@ async function cancelTask(taskId) {
   }
 }
 
+function openDeleteFileConfirm(file) {
+  if (ingestStartLocked.value || isFileBusy(file)) return
+  const name = file?.filename || shortFileId(file?.file_id)
+  deleteFileConfirm.value = {
+    file,
+    key: fileKey(file),
+    message: `将删除源文件「${name}」。这不会删除已经入库的聊天记录；如果需要再次处理，需要重新放回或重新上传该 JSON。`,
+  }
+}
+
+function closeDeleteFileConfirm() {
+  if (deleteFileBusy.value) return
+  deleteFileConfirm.value = null
+}
+
+async function confirmDeleteFile() {
+  const pending = deleteFileConfirm.value
+  const file = pending?.file
+  if (!file || deleteFileBusy.value) return
+  const key = pending.key || fileKey(file)
+  setBusy(deletingFileIds, key, true)
+  const controller = new AbortController()
+  activeFileDeleteControllers.add(controller)
+  deleteFileBusy.value = true
+  try {
+    const params = file.upload_id ? { upload_id: file.upload_id } : { file_id: file.file_id }
+    const result = await deleteIngestFile(params, { signal: controller.signal })
+    if (componentDisposed) return
+    deleteFileConfirm.value = null
+    toast(result.message || '源文件已删除', 'success')
+    await Promise.all([
+      loadFiles({ silent: true }),
+      loadTasks({ silent: true, preserveLoaded: true }),
+      loadIngestHealth({ silent: true }),
+    ])
+  } catch (e) {
+    if (!componentDisposed) toast(e.message, 'error')
+  } finally {
+    activeFileDeleteControllers.delete(controller)
+    if (!componentDisposed) {
+      deleteFileBusy.value = false
+      setBusy(deletingFileIds, key, false)
+    }
+  }
+}
+
 function connectWS(taskId) {
   if (componentDisposed) return
   if (wsConnections[taskId]) return
@@ -823,7 +914,7 @@ function connectWS(taskId) {
       if (['completed', 'error', 'cancelled'].includes(data.status)) {
         if (!batchRunning.value) {
           if (data.status === 'completed') toast('导入完成', 'success')
-          else if (data.status === 'error') toast('导入失败：' + (data.error || ''), 'error')
+          else if (data.status === 'error') toast('导入失败：' + taskFailureSummary(data), 'error')
         }
         wsConnections[taskId]?.close()
         delete wsConnections[taskId]
@@ -845,6 +936,7 @@ function mergeTaskStatus(taskId, data) {
   if (!task) return
   task.status = data.status
   task.error = data.error
+  task.error_info = data.error_info || null
   task.file_id = data.file_id || task.file_id
   task.mode = data.mode || task.mode
   task.progress = data.progress ?? task.progress
@@ -907,7 +999,40 @@ function taskProgress(task) {
     eta: task.eta || null,
     log_tail: task.log_tail || '',
     mode: task.mode,
+    error_info: task.error_info || null,
   }
+}
+
+function taskErrorInfo(task) {
+  const progress = taskProgress(task)
+  return progress?.error_info || task?.error_info || null
+}
+
+function taskErrorTitle(task) {
+  const info = taskErrorInfo(task)
+  return info?.type || '未知错误'
+}
+
+function taskErrorCode(task) {
+  const info = taskErrorInfo(task)
+  return info?.code || ''
+}
+
+function taskErrorAction(task) {
+  const info = taskErrorInfo(task)
+  return info?.action || ''
+}
+
+function taskErrorReturnCode(task) {
+  const info = taskErrorInfo(task)
+  return info?.return_code ?? null
+}
+
+function taskFailureSummary(task) {
+  if (!task) return '失败'
+  const info = task.error_info || null
+  const code = info?.code ? `（${info.code}）` : ''
+  return `${info?.type || taskStatusLabel(task.status)}${code}: ${task.error || info?.message || taskStatusLabel(task.status)}`
 }
 
 function taskFileLabel(task) {
@@ -1395,7 +1520,7 @@ function importButtonLabel(file) {
 
 .file-actions {
   display: grid;
-  grid-template-columns: minmax(124px, 150px) minmax(72px, auto);
+  grid-template-columns: minmax(124px, 150px) minmax(72px, auto) minmax(72px, auto);
   align-items: center;
   gap: var(--space-2);
 }
@@ -1409,6 +1534,10 @@ function importButtonLabel(file) {
 }
 
 .import-btn {
+  min-width: 72px;
+}
+
+.delete-file-btn {
   min-width: 72px;
 }
 
@@ -1481,6 +1610,31 @@ function importButtonLabel(file) {
   border-radius: var(--radius-sm);
   color: var(--accent-red);
   margin-bottom: var(--space-3);
+  overflow-wrap: anywhere;
+}
+
+.task-error-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-weight: 600;
+}
+
+.task-error-code {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.task-error-action,
+.task-error-meta,
+.task-error-message {
+  margin-top: 4px;
+  color: var(--text-secondary);
 }
 
 .task-actions {
@@ -1505,7 +1659,7 @@ function importButtonLabel(file) {
   }
 
   .file-actions {
-    grid-template-columns: 1fr auto;
+    grid-template-columns: 1fr auto auto;
   }
 
   .mode-select {

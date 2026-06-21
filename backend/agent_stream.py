@@ -21,6 +21,15 @@ _abort_lock = threading.Lock()
 ABORTED_ANSWER = "（用户已停止生成）"
 TOOL_ARGS_PREVIEW_LIMIT = 200
 TOOL_ERROR_SUMMARY_LIMIT = 160
+REASONING_KEYS = (
+    "reasoning_content",
+    "reasoning",
+    "thinking",
+    "reasoning_text",
+    "reasoning_summary",
+)
+REASONING_BLOCK_TYPES = {"reasoning", "thinking", "reasoning_content", "reasoning_summary"}
+TEXT_BLOCK_TYPES = {"text", "output_text"}
 
 
 def set_abort_flag(session_id: str) -> None:
@@ -41,6 +50,66 @@ def _is_aborted(session_id: str) -> bool:
 def _sse(event: str, data: Any) -> str:
     payload = json.dumps(data, ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _stringify_reasoning(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_stringify_reasoning(item) for item in value)
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in ("text", "content", "summary", "reasoning", "reasoning_content"):
+            if key in value:
+                parts.append(_stringify_reasoning(value.get(key)))
+        if parts:
+            return "".join(parts)
+        return ""
+    return str(value)
+
+
+def _split_content_parts(content: Any) -> tuple[str, str]:
+    if isinstance(content, str):
+        return content, ""
+    if not isinstance(content, list):
+        return agent_module._content_to_text(content), ""
+
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            text_parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            text_parts.append(str(item))
+            continue
+        block_type = str(item.get("type") or "").lower()
+        if block_type in REASONING_BLOCK_TYPES or "reasoning" in block_type or "thinking" in block_type:
+            reasoning_parts.append(_stringify_reasoning(item))
+        elif block_type in TEXT_BLOCK_TYPES:
+            text_parts.append(str(item.get("text") or item.get("content") or ""))
+        else:
+            text_parts.append(str(item.get("text") or item.get("content") or ""))
+    return "".join(text_parts), "".join(reasoning_parts)
+
+
+def _message_text(message: BaseMessage) -> str:
+    text, _reasoning = _split_content_parts(getattr(message, "content", ""))
+    return text
+
+
+def _message_reasoning(message: BaseMessage) -> str:
+    _text, reasoning = _split_content_parts(getattr(message, "content", ""))
+    parts = [reasoning]
+    for source_name in ("additional_kwargs", "response_metadata"):
+        source = getattr(message, source_name, None)
+        if not isinstance(source, dict):
+            continue
+        for key in REASONING_KEYS:
+            parts.append(_stringify_reasoning(source.get(key)))
+    return "".join(part for part in parts if part)
 
 
 def _tool_result_summary(tool_content: str) -> str:
@@ -106,7 +175,7 @@ def stream_agent(
         chat_history.extend([HumanMessage(content=question), AIMessage(content=local)])
         agent_module.trim_history(chat_history)
         yield _sse("text", {"chunk": local})
-        yield _sse("done", {"answer": local, "session_id": session_id})
+        yield _sse("done", {"answer": local, "thinking": "", "session_id": session_id})
         return
 
     try:
@@ -123,6 +192,7 @@ def stream_agent(
     ]
 
     full_answer = ""
+    full_thinking = ""
 
     try:
         for _round in range(agent_module.MAX_ROUNDS):
@@ -132,6 +202,10 @@ def stream_agent(
                 break
 
             ai_message = llm_with_tools.invoke(working_messages)
+            thinking = _message_reasoning(ai_message)
+            if thinking:
+                full_thinking += thinking
+                yield _sse("thinking", {"chunk": thinking})
             if _is_aborted(session_id):
                 full_answer = ABORTED_ANSWER
                 yield _sse("text", {"chunk": full_answer})
@@ -141,7 +215,7 @@ def stream_agent(
             tool_calls = getattr(ai_message, "tool_calls", None) or []
 
             if not tool_calls:
-                text = agent_module._content_to_text(ai_message.content).strip()
+                text = _message_text(ai_message).strip()
 
                 if not text and any(isinstance(m, ToolMessage) for m in working_messages):
                     synth_messages = [
@@ -157,7 +231,11 @@ def stream_agent(
                             )
                             yield _sse("text", {"chunk": ABORTED_ANSWER})
                             break
-                        piece = agent_module._content_to_text(chunk.content)
+                        thinking_piece = _message_reasoning(chunk)
+                        if thinking_piece:
+                            full_thinking += thinking_piece
+                            yield _sse("thinking", {"chunk": thinking_piece})
+                        piece = _message_text(chunk)
                         if piece:
                             full_answer += piece
                             yield _sse("text", {"chunk": piece})
@@ -226,4 +304,4 @@ def stream_agent(
     chat_history.extend([HumanMessage(content=question), AIMessage(content=full_answer)])
     agent_module.trim_history(chat_history)
 
-    yield _sse("done", {"answer": full_answer, "session_id": session_id})
+    yield _sse("done", {"answer": full_answer, "thinking": full_thinking, "session_id": session_id})

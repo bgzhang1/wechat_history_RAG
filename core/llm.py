@@ -72,6 +72,7 @@ def _remote_api_call(
 CHAT_MODEL_OVERRIDE: str | None = None
 CHAT_TIMEOUT_OVERRIDE: float | None = None
 CHAT_TEMPERATURE: float = 0.0
+REASONING_EFFORT_VALUES = {"low", "medium", "high"}
 
 
 PLACEHOLDER_VALUES = {
@@ -113,6 +114,19 @@ def _env_config_value(name: str) -> str:
     return (os.getenv(name) or "").strip()
 
 
+def _reasoning_effort_value(name: str) -> str:
+    value = _env_config_value(name).lower()
+    return value if value in REASONING_EFFORT_VALUES else ""
+
+
+def _chat_reasoning_effort() -> str:
+    return _reasoning_effort_value("CHAT_REASONING_EFFORT")
+
+
+def _summary_reasoning_effort() -> str:
+    return _reasoning_effort_value("SUMMARY_REASONING_EFFORT") or _chat_reasoning_effort()
+
+
 def chat_config_status(model: str | None = None) -> dict[str, Any]:
     explicit_model = model.strip() if isinstance(model, str) else None
     resolved_model = explicit_model or CHAT_MODEL_OVERRIDE or _env_config_value("CHAT_MODEL")
@@ -126,8 +140,43 @@ def chat_config_status(model: str | None = None) -> dict[str, Any]:
         "configured": not missing,
         "missing": missing,
         "model": resolved_model or "",
+        "reasoning_effort": _chat_reasoning_effort(),
         "using_model_override": bool(CHAT_MODEL_OVERRIDE and not explicit_model),
         "using_explicit_model": bool(explicit_model),
+    }
+
+
+def _summary_base_url() -> str:
+    return _env_config_value("SUMMARY_BASE_URL") or _env_config_value("CHAT_BASE_URL")
+
+
+def _summary_api_key() -> str:
+    return _env_config_value("SUMMARY_API_KEY") or _env_config_value("CHAT_API_KEY")
+
+
+def summary_config_status(model: str | None = None) -> dict[str, Any]:
+    explicit_model = model.strip() if isinstance(model, str) else None
+    resolved_model = explicit_model or _env_config_value("SUMMARY_MODEL")
+    summary_base_url = _env_config_value("SUMMARY_BASE_URL")
+    summary_api_key = _env_config_value("SUMMARY_API_KEY")
+    base_url = summary_base_url or _env_config_value("CHAT_BASE_URL")
+    api_key = summary_api_key or _env_config_value("CHAT_API_KEY")
+    required = {
+        "SUMMARY_BASE_URL/CHAT_BASE_URL": base_url,
+        "SUMMARY_API_KEY/CHAT_API_KEY": api_key,
+        "SUMMARY_MODEL": resolved_model,
+    }
+    missing = [name for name, value in required.items() if not _configured_value(value)]
+    return {
+        "configured": not missing,
+        "missing": missing,
+        "model": resolved_model or "",
+        "base_url": base_url,
+        "reasoning_effort": _summary_reasoning_effort(),
+        "using_explicit_model": bool(explicit_model),
+        "using_chat_base_url": not bool(summary_base_url),
+        "using_chat_api_key": not bool(summary_api_key),
+        "using_chat_reasoning_effort": not bool(_reasoning_effort_value("SUMMARY_REASONING_EFFORT")),
     }
 
 
@@ -161,7 +210,9 @@ def _chat_model_cached(
     timeout: float,
     temperature: float,
     max_retries: int,
+    reasoning_effort: str,
 ) -> ChatOpenAI:
+    model_kwargs = {"reasoning_effort": reasoning_effort} if reasoning_effort else {}
     return ChatOpenAI(
         model=model,
         base_url=base_url,
@@ -169,6 +220,7 @@ def _chat_model_cached(
         temperature=temperature,
         timeout=timeout,
         max_retries=max_retries,
+        model_kwargs=model_kwargs,
     )
 
 
@@ -190,6 +242,7 @@ def chat_model(model: str | None = None) -> ChatOpenAI:
         actual_timeout,
         CHAT_TEMPERATURE,
         _env_int("CHAT_MAX_RETRIES", 3, minimum=0),
+        _chat_reasoning_effort(),
     )
 
 
@@ -197,6 +250,34 @@ def invoke_chat(input: Any, model: str | None = None) -> Any:
     client = chat_model(model)
     attempts = _retry_attempts("CHAT_LOCAL_RETRIES")
     retry_sleep = _env_float("CHAT_RETRY_SLEEP", 1.0, minimum=0.0)
+    return _remote_api_call(lambda: client.invoke(input), attempts, retry_sleep)
+
+
+def summary_model(model: str | None = None) -> ChatOpenAI:
+    status = summary_config_status(model)
+    if not status["configured"]:
+        missing = ", ".join(status["missing"])
+        raise RuntimeError(f"摘要模型尚未配置，缺少：{missing}")
+    actual_timeout = (
+        CHAT_TIMEOUT_OVERRIDE
+        if CHAT_TIMEOUT_OVERRIDE is not None
+        else _env_float("CHAT_TIMEOUT", 300.0, minimum=1.0)
+    )
+    return _chat_model_cached(
+        status["model"],
+        _summary_base_url(),
+        _summary_api_key(),
+        actual_timeout,
+        CHAT_TEMPERATURE,
+        _env_int("CHAT_MAX_RETRIES", 3, minimum=0),
+        _summary_reasoning_effort(),
+    )
+
+
+def invoke_summary(input: Any, model: str | None = None) -> Any:
+    client = summary_model(model)
+    attempts = _retry_attempts("SUMMARY_LOCAL_RETRIES", _retry_attempts("CHAT_LOCAL_RETRIES"))
+    retry_sleep = _env_float("SUMMARY_RETRY_SLEEP", _env_float("CHAT_RETRY_SLEEP", 1.0, minimum=0.0), minimum=0.0)
     return _remote_api_call(lambda: client.invoke(input), attempts, retry_sleep)
 
 

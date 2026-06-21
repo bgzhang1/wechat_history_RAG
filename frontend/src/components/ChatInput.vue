@@ -276,25 +276,38 @@ onUnmounted(() => {
 
 <style scoped>
 .chat-input-area {
-  padding: var(--space-4) var(--space-6) var(--space-6);
+  padding: var(--space-4) var(--space-8) var(--space-6);
   position: relative;
-  max-width: 800px;
+  max-width: 900px;
   margin: 0 auto;
   width: 100%;
+  background:
+    linear-gradient(180deg, transparent 0%, color-mix(in srgb, var(--bg-primary) 88%, transparent) 34%, var(--bg-primary) 100%);
 }
 
 .input-wrapper {
   display: flex;
   align-items: flex-end;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
+  gap: var(--space-3);
+  padding: var(--space-3);
   border: 1px solid var(--border-default);
-  transition: border-color var(--transition-fast);
+  background: color-mix(in srgb, var(--bg-elevated) 88%, transparent);
+  box-shadow: var(--shadow-md);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), background var(--transition-fast);
 }
 
 .input-wrapper:focus-within {
   border-color: var(--border-focus);
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.08);
+  background: var(--bg-elevated);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.10), var(--shadow-lg);
+}
+
+:global(.dark) .input-wrapper {
+  background: #1d2633;
+}
+
+:global(.dark) .send-btn:disabled {
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .chat-textarea {
@@ -304,11 +317,11 @@ onUnmounted(() => {
   outline: none;
   color: var(--text-primary);
   font-family: var(--font-sans);
-  font-size: var(--text-base);
-  line-height: 1.5;
+  font-size: 0.95rem;
+  line-height: 1.55;
   resize: none;
   max-height: 160px;
-  padding: var(--space-2) 0;
+  padding: 9px 0;
 }
 
 .chat-textarea::placeholder {
@@ -326,9 +339,14 @@ onUnmounted(() => {
 }
 
 .send-btn, .stop-btn {
-  width: 40px;
-  height: 40px;
+  width: 42px;
+  height: 42px;
   border-radius: var(--radius-md);
+}
+
+.send-btn:disabled {
+  background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+  box-shadow: none;
 }
 
 .stop-btn {
@@ -341,7 +359,7 @@ onUnmounted(() => {
   bottom: 100%;
   left: var(--space-6);
   right: var(--space-6);
-  max-width: calc(800px - var(--space-6) * 2);
+  max-width: calc(900px - var(--space-6) * 2);
   margin: 0 auto var(--space-2) auto;
   background: var(--bg-elevated);
   border: 1px solid var(--border-default);
@@ -356,7 +374,7 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-3);
   cursor: pointer;
   transition: background var(--transition-fast);
 }

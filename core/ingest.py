@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from . import store
 from .chunker import Chunk, chunk_thread
 from .console import setup_utf8_console
-from .llm import chat_config_status, embed, embed_configured, invoke_chat
+from .llm import embed, embed_configured, invoke_summary, summary_config_status
 from .parser import file_scope_for_path, is_weflow_export, parse_weflow
 from .redaction import redact_text
 
@@ -224,7 +224,7 @@ def summary_config_reason(summary_model: str, status: dict[str, object]) -> str:
         return "未配置 SUMMARY_MODEL"
     raw_missing = status.get("missing", [])
     missing_names = raw_missing if isinstance(raw_missing, list) else []
-    missing = ["SUMMARY_MODEL" if name == "CHAT_MODEL" else str(name) for name in missing_names]
+    missing = [str(name) for name in missing_names]
     if missing:
         return "未配置 " + "、".join(missing)
     return "摘要模型不可用"
@@ -316,7 +316,7 @@ def parse_summary_batch_response(raw: str, expected_ids: list[int]) -> dict[int,
 
 
 def summarize_once(model_name: str, text: str) -> str | None:
-    res = invoke_chat(SUMMARY_PROMPT + text, model_name)
+    res = invoke_summary(SUMMARY_PROMPT + text, model_name)
     summary = str(res.content).strip()
     return summary or None
 
@@ -330,7 +330,7 @@ def summarize_batch_once(
         {"id": local_id, "text": chunk.text[:max_chars]}
         for local_id, (_, chunk) in enumerate(items, start=1)
     ]
-    res = invoke_chat(SUMMARY_BATCH_PROMPT + json.dumps(payload, ensure_ascii=False), model_name)
+    res = invoke_summary(SUMMARY_BATCH_PROMPT + json.dumps(payload, ensure_ascii=False), model_name)
     expected_ids = list(range(1, len(items) + 1))
     return parse_summary_batch_response(str(res.content), expected_ids)
 
@@ -560,8 +560,13 @@ def ingest_files(
             emit_progress("parsing", finish_progress, f"WeFlow 内容解析失败 {file_index}/{total_files}: {file_label}")
             continue
 
+        write_progress = start_progress
+        if finish_progress > start_progress:
+            write_progress = start_progress + max(1, (finish_progress - start_progress) // 2)
+        emit_progress("indexing", write_progress, f"写入消息库 {file_index}/{total_files}: {file_label}")
         usable_files += 1
         write_result = store.upsert_messages(result.messages)
+        emit_progress("indexing", write_progress, f"记录文件来源 {file_index}/{total_files}: {file_label}")
         record_file_message_sources(file_key, [message.id for message in result.messages])
         inserted = write_result.inserted
         updated = write_result.updated
@@ -709,7 +714,7 @@ def main() -> None:
 
     has_message_changes = (total_inserted + total_updated) > 0
     summary_model = (os.getenv("SUMMARY_MODEL") or "").strip()
-    summary_status = chat_config_status(summary_model) if summary_model else {"configured": False, "missing": ["SUMMARY_MODEL"]}
+    summary_status = summary_config_status(summary_model) if summary_model else {"configured": False, "missing": ["SUMMARY_MODEL"]}
     summary_ready = bool(summary_status["configured"]) and not args.no_summary
     embed_ready = embed_configured() and store.has_vec()
 

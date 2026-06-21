@@ -275,6 +275,7 @@ SSE 事件：
   "max_rounds": 12,
   "max_history_messages": 40,
   "chat_model": "gpt-4o",
+  "summary_model": "gpt-4o-mini",
   "chat_timeout": 300.0,
   "chat_temperature": 0.0,
   "enabled_tools": ["search_messages", "semantic_search", "get_context", "browse_by_time", "get_stats"],
@@ -286,7 +287,7 @@ SSE 事件：
 
 `POST /api/settings`
 
-所有字段均可选，只传需要修改的字段。设置页保存的都是非密钥运行时配置，会持久化到 `runtime/backend_settings.json`（可用 `BACKEND_SETTINGS_FILE` 调整路径）；API Key 仍只从 `.env` / 环境变量读取。`chat_model` 和 `chat_timeout` 只有在不同于当前环境变量值时才作为运行时覆盖值持久化，避免普通保存操作把 `.env` 中的模型配置冻结成旧值。`enabled_tools` 是 Agent 的最终可调用工具白名单，每轮对话会自动把当前启用/停用工具策略追加到系统提示词，避免自定义提示词继续引导模型调用已停用工具。响应中的 `available_tools` 是只读字段，用于前端渲染当前后端注册的工具列表，不会写入持久化设置文件。
+所有字段均可选，只传需要修改的字段。设置页保存的都是非密钥运行时配置，会持久化到 `runtime/backend_settings.json`（可用 `BACKEND_SETTINGS_FILE` 调整路径）；API Key 仍只从 `.env` / 环境变量读取。`chat_model`、`summary_model` 和 `chat_timeout` 只有在不同于当前环境变量值时才作为运行时覆盖值持久化，避免普通保存操作把 `.env` 中的模型配置冻结成旧值。`summary_model` 保存后会作为后续导入子进程的 `SUMMARY_MODEL` 使用。`enabled_tools` 是 Agent 的最终可调用工具白名单，每轮对话会自动把当前启用/停用工具策略追加到系统提示词，避免自定义提示词继续引导模型调用已停用工具。响应中的 `available_tools` 是只读字段，用于前端渲染当前后端注册的工具列表，不会写入持久化设置文件。
 
 ```json
 {
@@ -306,6 +307,7 @@ SSE 事件：
 | `max_rounds` | 1-200 |
 | `max_history_messages` | 0-200；为 0 时本轮不携带历史消息 |
 | `chat_model` | 最长 200 字符 |
+| `summary_model` | 最长 200 字符 |
 | `chat_timeout` | 1-1800 秒 |
 | `chat_temperature` | 0-2 |
 | `enabled_tools` | 至少 1 个，且必须是已知工具名 |
@@ -592,7 +594,40 @@ SSE 事件：
 }
 ```
 
-### 6.3 启动导入任务
+### 6.3 删除可导入源文件
+
+`POST /api/ingest/files/delete`
+
+必须且只能提供 `upload_id` 或 `file_id` 中的一项。删除的是 `local/` 下的源 JSON 文件或上传目录中的源 JSON 及其 sidecar 元数据；已经解析入库的聊天消息、会话块、摘要和向量不会自动删除。
+
+如果该文件当前有运行中或正在取消的导入任务，接口返回 `409`，避免删除正在被读取的源文件。
+
+请求体示例：
+
+```json
+{
+  "upload_id": "99ca3f..."
+}
+```
+
+或：
+
+```json
+{
+  "file_id": "data/wechat_history.json"
+}
+```
+
+响应：
+
+```json
+{
+  "file_id": "uploads/99ca3f....json",
+  "message": "源 JSON 文件已删除；已入库的聊天记录不会自动删除。"
+}
+```
+
+### 6.4 启动导入任务
 
 `POST /api/ingest/start`
 
@@ -646,7 +681,7 @@ SSE 事件：
 
 同一时间只允许一个导入任务运行；重复启动会返回 `409`。
 
-### 6.4 获取任务状态
+### 6.5 获取任务状态
 
 `GET /api/ingest/status/{task_id}`
 
@@ -681,7 +716,7 @@ SSE 事件：
 | `completed` | 已完成 |
 | `error` | 导入失败 |
 
-### 6.5 列出任务
+### 6.6 列出任务
 
 `GET /api/ingest/tasks?limit=50&offset=0`
 
@@ -715,7 +750,7 @@ SSE 事件：
 
 任务列表不会返回完整 `logs`，但会返回轻量进度字段，供页面刷新或 WebSocket 暂未连接时继续显示进度条。
 
-### 6.6 取消导入任务
+### 6.7 取消导入任务
 
 `POST /api/ingest/tasks/{task_id}/cancel`
 
@@ -723,7 +758,7 @@ SSE 事件：
 
 响应为任务状态对象。
 
-### 6.7 WebSocket 实时导入进度
+### 6.8 WebSocket 实时导入进度
 
 `WS /api/ws/ingest/{task_id}`
 

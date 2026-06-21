@@ -201,6 +201,7 @@ function actionTarget(check) {
     database: 'ingest',
     vector_index: 'ingest',
     chat_model: 'settings',
+    embedding_model: 'settings',
     chat_sessions: 'logs',
   }
   return map[check?.component] || null

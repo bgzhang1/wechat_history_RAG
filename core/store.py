@@ -332,6 +332,7 @@ def init_schema(conn: sqlite3.Connection, vec_available: bool | None = None) -> 
         CREATE INDEX IF NOT EXISTS idx_sender ON messages(sender);
         CREATE INDEX IF NOT EXISTS idx_seq    ON messages(thread, seq);
         CREATE INDEX IF NOT EXISTS idx_thread_time ON messages(thread, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_reply_thread ON messages(reply_to, thread);
         CREATE INDEX IF NOT EXISTS idx_sender_time ON messages(sender, timestamp);
         CREATE INDEX IF NOT EXISTS idx_self_time   ON messages(is_self, timestamp);
 

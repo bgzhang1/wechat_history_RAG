@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from core import store
-from core.llm import chat_config_status, embed_config_status
+from core.llm import chat_config_status, embed_config_status, summary_config_status
 
 from . import session_store
 from .errors import http_exception_handler, unhandled_exception_handler, validation_exception_handler
@@ -100,7 +100,7 @@ def _summary_config_status() -> dict:
     summary_model = (os.getenv("SUMMARY_MODEL") or "").strip()
     if not summary_model:
         return {"configured": False, "missing": ["SUMMARY_MODEL"], "model": ""}
-    return chat_config_status(summary_model)
+    return summary_config_status(summary_model)
 
 
 def _chat_model_action(chat_status: dict) -> tuple[str, str | None]:
@@ -108,14 +108,11 @@ def _chat_model_action(chat_status: dict) -> tuple[str, str | None]:
         return f"已配置模型：{chat_status['model']}", None
     missing = list(chat_status.get("missing") or [])
     detail = f"缺少配置：{', '.join(missing)}"
-    if set(missing) == {"CHAT_MODEL"}:
-        return detail, "请在设置页填写对话模型，或在 .env / 环境变量中设置 CHAT_MODEL。"
-    return detail, "请在 .env 或环境变量中设置 CHAT_BASE_URL、CHAT_API_KEY 和 CHAT_MODEL。"
+    return detail, "请在设置页检查对话 Base URL 和模型；API Key 仍需在 .env 或环境变量中配置。"
 
 
 def _chat_model_action_target(chat_status: dict) -> str | None:
-    missing = set(chat_status.get("missing") or [])
-    return "settings" if missing == {"CHAT_MODEL"} else None
+    return "settings" if chat_status.get("missing") else None
 
 
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
@@ -222,7 +219,7 @@ def _diagnostics() -> dict:
             ),
             "recoverable": True,
             "action": None if embed_status["configured"] else "请设置 EMBED_BASE_URL、EMBED_API_KEY 和 EMBED_MODEL 以启用向量检索。",
-            "action_target": None,
+            "action_target": None if embed_status["configured"] else "settings",
         }
     )
 
@@ -255,7 +252,7 @@ def _diagnostics() -> dict:
             vector_action_target = "ingest"
         elif not embed_status["configured"]:
             vector_action = "请设置 EMBED_BASE_URL、EMBED_API_KEY 和 EMBED_MODEL，然后重新运行导入。"
-            vector_action_target = None
+            vector_action_target = "settings"
         else:
             vector_action = "请在数据导入面板执行仅向量构建，或重新运行完整导入以生成缺失向量。"
             vector_action_target = "ingest"
