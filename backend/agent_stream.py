@@ -11,7 +11,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 import core.agent as agent_module
-from core.llm import chat_model
+from core.llm import chat_model, invoke_chat, stream_chat
 
 from .redaction import public_exception_message, redact_data, redact_text
 
@@ -179,8 +179,7 @@ def stream_agent(
         return
 
     try:
-        llm_with_tools = chat_model().bind_tools(agent_module.get_active_tools())
-        llm_plain = chat_model()
+        chat_model()
     except Exception as exc:
         yield _sse("error", {"detail": public_exception_message("Agent 初始化失败", exc)})
         return
@@ -193,6 +192,7 @@ def stream_agent(
 
     full_answer = ""
     full_thinking = ""
+    nudge_count = 0
 
     try:
         for _round in range(agent_module.MAX_ROUNDS):
@@ -201,7 +201,7 @@ def stream_agent(
                 yield _sse("text", {"chunk": full_answer})
                 break
 
-            ai_message = llm_with_tools.invoke(working_messages)
+            ai_message = invoke_chat(working_messages, tools=agent_module.get_active_tools())
             thinking = _message_reasoning(ai_message)
             if thinking:
                 full_thinking += thinking
@@ -216,13 +216,14 @@ def stream_agent(
 
             if not tool_calls:
                 text = _message_text(ai_message).strip()
+                has_tools = agent_module._has_tool_calls_in_history(working_messages)
 
-                if not text and any(isinstance(m, ToolMessage) for m in working_messages):
+                if not text and has_tools:
                     synth_messages = [
                         *working_messages,
                         HumanMessage(content=f"User original question: {question}\n\n{agent_module.EMPTY_REPLY_NUDGE}"),
                     ]
-                    for chunk in llm_plain.stream(synth_messages):
+                    for chunk in stream_chat(synth_messages):
                         if _is_aborted(session_id):
                             full_answer = (
                                 ABORTED_ANSWER
@@ -246,9 +247,31 @@ def stream_agent(
                             "检索已完成，但模型没有生成有效回答。请换一种问法，或缩小时间范围后重试。"
                         )
                         yield _sse("text", {"chunk": full_answer})
-                elif not text:
-                    full_answer = "模型返回了空回答，本轮已停止。"
+                elif not text and not has_tools:
+                    if nudge_count < agent_module.MAX_NUDGES and _round < agent_module.MAX_ROUNDS - 1:
+                        nudge_count += 1
+                        nudge = agent_module.NO_TOOL_NUDGE.format(question=question)
+                        full_answer = ""
+                        full_thinking = ""
+                        working_messages.append(HumanMessage(content=nudge))
+                        print(f"  [nudge] 模型未调用任何工具即返回空回答，追加引导提示", file=sys.stderr)
+                        continue
+                    full_answer = "模型未调用检索工具且返回了空回答，本轮已停止。请确认已导入聊天记录后重试。"
                     yield _sse("text", {"chunk": full_answer})
+                elif agent_module._looks_like_giving_up(text, has_tool_results=has_tools):
+                    if nudge_count < agent_module.MAX_NUDGES and _round < agent_module.MAX_ROUNDS - 1:
+                        nudge_count += 1
+                        if not has_tools:
+                            nudge = agent_module.NO_TOOL_NUDGE.format(question=question)
+                        else:
+                            nudge = agent_module.RETRY_NUDGE.format(question=question)
+                        full_answer = ""
+                        full_thinking = ""
+                        working_messages.append(HumanMessage(content=nudge))
+                        print(f"  [nudge] 模型疑似提前放弃，追加引导提示", file=sys.stderr)
+                        continue
+                    full_answer = text
+                    yield _sse("text", {"chunk": text})
                 else:
                     full_answer = text
                     yield _sse("text", {"chunk": text})
