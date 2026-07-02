@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 ToolName = Annotated[str, Field(min_length=1, max_length=64)]
 
@@ -17,6 +17,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=8000, description="用户问题")
     session_id: str | None = Field(default=None, max_length=120, description="会话 ID，不传则创建新会话")
+    effort: str | None = Field(default=None, max_length=10, description="本次提问的检索努力档位：low / medium / high / max，留空用全局档位")
 
     @field_validator("question", mode="before")
     @classmethod
@@ -40,6 +41,18 @@ class ChatRequest(BaseModel):
             raise ValueError("session_id cannot be empty")
         return normalized
 
+    @field_validator("effort", mode="before")
+    @classmethod
+    def normalize_effort(cls, value: object) -> object:
+        if value is None or not isinstance(value, str):
+            return value
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized not in {"low", "medium", "high", "max"}:
+            raise ValueError("effort must be one of: low, medium, high, max")
+        return normalized
+
 
 class ChatResponse(BaseModel):
     answer: str
@@ -53,7 +66,8 @@ class SettingsModel(BaseModel):
     chat_base_url: str | None = Field(default=None, max_length=500, description="OpenAI 兼容聊天模型 Base URL")
     chat_model: str | None = Field(default=None, max_length=200, description="大语言模型名称")
     chat_reasoning_effort: str | None = Field(default=None, max_length=20, description="对话模型思考强度：low / medium / high，留空则不传")
-    chat_max_retries: int | None = Field(default=None, ge=0, le=10, description="聊天模型 SDK 重试次数")
+    request_failure_retries: int | None = Field(default=None, ge=0, le=10, description="请求失败重试次数")
+    request_failure_retry_interval: float | None = Field(default=None, ge=0.0, le=300.0, description="请求失败重试基础间隔秒数")
     summary_base_url: str | None = Field(default=None, max_length=500, description="OpenAI 兼容摘要模型 Base URL，留空继承聊天配置")
     summary_model: str | None = Field(default=None, max_length=200, description="摘要生成模型名称")
     summary_reasoning_effort: str | None = Field(default=None, max_length=20, description="摘要模型思考强度，留空继承对话配置")
@@ -64,7 +78,6 @@ class SettingsModel(BaseModel):
     embed_base_url: str | None = Field(default=None, max_length=500, description="OpenAI 兼容 Embedding Base URL")
     embed_model: str | None = Field(default=None, max_length=200, description="Embedding 模型名称")
     embed_timeout: float | None = Field(default=None, ge=1.0, le=1800.0, description="Embedding 请求超时时间(秒)")
-    embed_max_retries: int | None = Field(default=None, ge=0, le=10, description="Embedding SDK 重试次数")
     embed_workers: int | None = Field(default=None, ge=1, le=64, description="Embedding 并发线程数")
     embed_batch_size: int | None = Field(default=None, ge=1, le=512, description="Embedding 单批会话块数量")
     chat_timeout: float | None = Field(default=None, ge=1.0, le=1800.0, description="单次请求超时时间(秒)")
@@ -115,6 +128,21 @@ class SettingsModel(BaseModel):
 class SettingsUpdateModel(SettingsModel):
     chat_api_key: str | None = Field(default=None, max_length=1000, description="聊天模型 API Key，只用于更新，不会在响应中返回")
     summary_api_key: str | None = Field(default=None, max_length=1000, description="摘要模型 API Key，留空继承聊天配置")
+
+    @model_validator(mode="before")
+    @classmethod
+    def merge_legacy_retry_fields(cls, values: object) -> object:
+        if not isinstance(values, dict) or "request_failure_retries" in values:
+            return values
+        legacy_fields = ("chat_max_retries", "embed_max_retries")
+        if not any(field in values for field in legacy_fields):
+            return values
+        merged = dict(values)
+        legacy_values = [int(merged[field]) for field in legacy_fields if merged.get(field) is not None]
+        merged["request_failure_retries"] = max(legacy_values) if legacy_values else None
+        for field in legacy_fields:
+            merged.pop(field, None)
+        return merged
 
     @field_validator("chat_api_key", "summary_api_key", mode="before")
     @classmethod

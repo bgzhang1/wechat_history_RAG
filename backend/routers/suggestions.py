@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from starlette.concurrency import run_in_threadpool
 
 from core import store
 from .params import query_int, query_str
@@ -61,6 +62,8 @@ async def suggestions_socket(websocket: WebSocket) -> None:
             if limit <= 0:
                 await websocket.send_json({"query": "", "items": []})
                 continue
-            await websocket.send_json(store.suggest_entities(query=query, limit=limit))
+            # SQLite 聚合查询必须放线程池，否则会阻塞事件循环（拖慢 SSE 等所有并发请求）
+            result = await run_in_threadpool(store.suggest_entities, query=query, limit=limit)
+            await websocket.send_json(result)
     except WebSocketDisconnect:
         return

@@ -6,6 +6,7 @@ from langchain_core.messages import BaseMessage
 
 from . import store
 from .agent import run_agent
+from . import agent as agent_module
 from .console import setup_utf8_console
 from .llm import chat_configured
 from .redaction import public_exception_message
@@ -33,7 +34,8 @@ def main() -> None:
     earliest = (stats["time_span"]["earliest"] or "")[:10]
     latest = (stats["time_span"]["latest"] or "")[:10]
     print("微信聊天记录检索 Agent / Python + LangChain（输入 exit 退出）")
-    print(f"已索引 {stats['total_messages']} 条消息 / {stats['indexed_session_chunks']} 个会话块，时间跨度 {earliest} ~ {latest}\n")
+    print(f"已索引 {stats['total_messages']} 条消息 / {stats['indexed_session_chunks']} 个会话块，时间跨度 {earliest} ~ {latest}")
+    print(f"检索努力档位：{agent_module.SEARCH_EFFORT}（输入 /effort low|medium|high|max 切换）\n")
     if int(stats.get("indexed_session_chunks") or 0) == 0:
         print(
             "提示：当前没有会话块索引，语义检索效果会受限。"
@@ -51,6 +53,21 @@ def main() -> None:
 
         if not question or question.lower() in {"exit", "quit", "q"}:
             break
+
+        if question.startswith("/effort"):
+            parts = question.split()
+            if len(parts) < 2:
+                print(f"当前检索努力档位：{agent_module.SEARCH_EFFORT}（可选 low / medium / high / max）")
+            else:
+                try:
+                    preset = agent_module.set_search_effort(parts[1])
+                    print(
+                        f"已切换检索努力档位：{agent_module.SEARCH_EFFORT}"
+                        f"（最多 {preset['max_rounds']} 轮工具调用）"
+                    )
+                except ValueError as exc:
+                    print(f"[错误] {exc}")
+            continue
 
         print("\n助手: ", end="", flush=True)
         try:

@@ -21,6 +21,7 @@ SessionStatus = Literal["idle", "running", "aborting", "error"]
 
 _conn: sqlite3.Connection | None = None
 _lock = threading.RLock()
+_reasoning_column_verified_conn: int | None = None
 
 
 class ActiveSessionError(RuntimeError):
@@ -75,11 +76,12 @@ def db() -> sqlite3.Connection:
 
 
 def close_connection() -> None:
-    global _conn
+    global _conn, _reasoning_column_verified_conn
     with _lock:
         if _conn is not None:
             _conn.close()
             _conn = None
+        _reasoning_column_verified_conn = None
 
 
 def init_schema(conn: sqlite3.Connection | None = None) -> None:
@@ -131,11 +133,16 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _ensure_reasoning_column_unlocked(conn: sqlite3.Connection) -> None:
+    global _reasoning_column_verified_conn
+    # 每个连接只需检查一次；此前每次读写消息都会重复执行 PRAGMA table_info
+    if _reasoning_column_verified_conn == id(conn):
+        return
     columns = {
         str(row["name"])
         for row in conn.execute("PRAGMA table_info(backend_chat_messages)").fetchall()
     }
     if REASONING_COLUMN in columns:
+        _reasoning_column_verified_conn = id(conn)
         return
     try:
         conn.execute(f"ALTER TABLE backend_chat_messages ADD COLUMN {REASONING_COLUMN} TEXT")
@@ -143,6 +150,7 @@ def _ensure_reasoning_column_unlocked(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError as exc:
         if "duplicate column name" not in str(exc).lower():
             raise
+    _reasoning_column_verified_conn = id(conn)
 
 
 def _make_title(question: str) -> str:

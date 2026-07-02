@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ..console import setup_utf8_console
-from ..llm import EMBED_DIM, chat_configured, chat_model, embed, embed_configured
+from ..llm import EMBED_DIM, chat_configured, embed, embed_configured, invoke_chat
 from ..redaction import public_exception_message
 
 
@@ -12,7 +12,7 @@ def main() -> None:
 
     if chat_configured():
         try:
-            res = chat_model().invoke("回复 OK 两个字母即可")
+            res = invoke_chat("回复 OK 两个字母即可")
             print(f"ok chat 端点连通：{str(res.content).strip()}")
         except Exception as exc:
             ok = False

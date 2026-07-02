@@ -219,6 +219,17 @@ def format_error_counts(errors: dict[str, int]) -> str:
     return "，".join(f"{name}×{count}" for name, count in sorted(errors.items()))
 
 
+def format_error_detail(errors: dict[str, int], examples: dict[str, str], limit: int = 3) -> str:
+    parts: list[str] = []
+    counts = format_error_counts(errors)
+    if counts:
+        parts.append(counts)
+    for name, example in list(sorted(examples.items()))[:limit]:
+        if example:
+            parts.append(f"{name}: {example}")
+    return "；".join(parts) or "未知错误"
+
+
 def summary_config_reason(summary_model: str, status: dict[str, object]) -> str:
     if not summary_model:
         return "未配置 SUMMARY_MODEL"
@@ -960,7 +971,8 @@ def main() -> None:
         store.set_summaries(list(summary_buffer))
         summary_buffer.clear()
         record_pending_files(pending_file_records)
-        emit_progress("error", 0, f"{stage} 失败")
+        detail = format_error_detail(errors, examples)
+        emit_progress("error", 0, f"{stage} 失败：{detail}")
         print(f"\n[错误] {stage} 失败，已停止 ingest（{format_error_counts(errors)}）。")
         for name, example in list(sorted(examples.items()))[:3]:
             print(f"  {name}: {example}")

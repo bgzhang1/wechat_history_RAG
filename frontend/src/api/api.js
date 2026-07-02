@@ -189,9 +189,10 @@ function del(path, body, options = {}) {
  * @param {string} question
  * @param {string|null} sessionId
  * @param {object} callbacks – { onSession, onToolCall, onToolResult, onThinking, onText, onDone, onError }
+ * @param {object} [options] – { effort } 检索努力档位：low / medium / high / max，留空用后端全局档位
  * @returns {{ abort: Function }} controller to stop the stream client-side
  */
-export function chatSSE(question, sessionId, callbacks = {}) {
+export function chatSSE(question, sessionId, callbacks = {}, options = {}) {
   const controller = new AbortController()
   let aborted = false
   let terminalSeen = false
@@ -201,6 +202,7 @@ export function chatSSE(question, sessionId, callbacks = {}) {
     try {
       const body = { question }
       if (sessionId) body.session_id = sessionId
+      if (options.effort) body.effort = options.effort
       const res = await fetch(`${API}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

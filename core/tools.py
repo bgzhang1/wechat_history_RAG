@@ -70,7 +70,12 @@ class TimeMixin(BaseModel):
 
 
 class SearchArgs(TimeMixin):
-    query: str = Field(..., min_length=1, max_length=MAX_TOOL_QUERY_CHARS, description="搜索关键词，多个词用空格分隔")
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_TOOL_QUERY_CHARS,
+        description="搜索关键词，多个词用空格分隔（AND 关系，须同条消息全部出现，宜少而精 1~2 个；不要传整句话）",
+    )
     sender: str | None = Field(default=None, max_length=MAX_FILTER_CHARS, description='只搜此发送人，可选。传 "我" 表示只搜自己发的消息')
     thread: str | None = Field(default=None, max_length=MAX_FILTER_CHARS, description="只搜此群聊/会话，可选")
     after: str | None = Field(default=None, description="起始时间 ISO 格式，可选")
@@ -148,7 +153,8 @@ class BrowseArgs(TimeMixin):
 
 @tool("search_messages", args_schema=SearchArgs)
 def search_messages(**kwargs: Any) -> str:
-    """按关键词精确全文检索聊天消息。问题包含人名、店名、物品、专有名词或原话片段时优先使用。"""
+    """按关键词精确全文检索聊天消息。问题包含人名、店名、物品、专有名词或原话片段时优先使用。
+    多个关键词为 AND 关系（须同一条消息内全部出现）；AND 无命中时自动放宽为 OR 并在 note 中说明。"""
     return _json(store.search_messages({key: value for key, value in kwargs.items() if value is not None}))
 
 

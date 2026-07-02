@@ -34,7 +34,8 @@ _ENV_RUNTIME_FIELDS: dict[str, str] = {
     "chat_base_url": "CHAT_BASE_URL",
     "chat_api_key": "CHAT_API_KEY",
     "chat_reasoning_effort": "CHAT_REASONING_EFFORT",
-    "chat_max_retries": "CHAT_MAX_RETRIES",
+    "request_failure_retries": "REQUEST_FAILURE_RETRIES",
+    "request_failure_retry_interval": "REQUEST_FAILURE_RETRY_INTERVAL",
     "summary_base_url": "SUMMARY_BASE_URL",
     "summary_api_key": "SUMMARY_API_KEY",
     "summary_reasoning_effort": "SUMMARY_REASONING_EFFORT",
@@ -45,14 +46,15 @@ _ENV_RUNTIME_FIELDS: dict[str, str] = {
     "embed_base_url": "EMBED_BASE_URL",
     "embed_model": "EMBED_MODEL",
     "embed_timeout": "EMBED_TIMEOUT",
-    "embed_max_retries": "EMBED_MAX_RETRIES",
     "embed_workers": "EMBED_WORKERS",
     "embed_batch_size": "EMBED_BATCH_SIZE",
 }
+_SECRET_RUNTIME_FIELDS = {"chat_api_key", "summary_api_key"}
 _DEFAULT_ENV_VALUES = {name: os.environ.get(name) for name in _ENV_RUNTIME_FIELDS.values()}
 SETTINGS_PATH = Path(os.getenv("BACKEND_SETTINGS_FILE", str(Path("runtime") / "backend_settings.json")))
 _settings_lock = threading.RLock()
 _summary_model_override: str | None = None
+_runtime_secret_override_fields: set[str] = set()
 
 
 def _clear_model_cache() -> None:
@@ -141,7 +143,8 @@ def _runtime_settings_unlocked() -> SettingsUpdateModel:
         chat_api_key=_env_display_value("CHAT_API_KEY"),
         chat_model=llm_module.CHAT_MODEL_OVERRIDE or llm_module._env_config_value("CHAT_MODEL"),
         chat_reasoning_effort=llm_module._chat_reasoning_effort(),
-        chat_max_retries=_env_int_display("CHAT_MAX_RETRIES", 3, minimum=0),
+        request_failure_retries=llm_module.request_failure_retries(),
+        request_failure_retry_interval=llm_module.request_failure_retry_interval(),
         summary_base_url=_env_display_value("SUMMARY_BASE_URL"),
         summary_api_key=_env_display_value("SUMMARY_API_KEY"),
         summary_model=_effective_summary_model_unlocked(),
@@ -153,7 +156,6 @@ def _runtime_settings_unlocked() -> SettingsUpdateModel:
         embed_base_url=_env_display_value("EMBED_BASE_URL"),
         embed_model=_env_display_value("EMBED_MODEL"),
         embed_timeout=_env_float_display("EMBED_TIMEOUT", 90.0, minimum=1.0),
-        embed_max_retries=_env_int_display("EMBED_MAX_RETRIES", 0, minimum=0),
         embed_workers=_env_int_display("EMBED_WORKERS", 4, minimum=1),
         embed_batch_size=_env_int_display("EMBED_BATCH_SIZE", 32, minimum=1),
         chat_timeout=(
@@ -204,6 +206,12 @@ def _field_provided(req: SettingsUpdateModel, field: str) -> bool:
     return field in req.model_fields_set
 
 
+def _request_failure_retries_update(req: SettingsUpdateModel) -> tuple[bool, int | None]:
+    if _field_provided(req, "request_failure_retries"):
+        return True, req.request_failure_retries
+    return False, None
+
+
 def _apply_settings_unlocked(req: SettingsUpdateModel) -> bool:
     enabled_tools = _validate_enabled_tools(req.enabled_tools) if req.enabled_tools is not None else None
     cache_needs_clear = False
@@ -213,9 +221,18 @@ def _apply_settings_unlocked(req: SettingsUpdateModel) -> bool:
         agent_module.MAX_ROUNDS = req.max_rounds
     if req.max_history_messages is not None:
         agent_module.MAX_HISTORY_MESSAGES = req.max_history_messages
+    request_retries_provided, request_retries = _request_failure_retries_update(req)
     for field, env_name in _ENV_RUNTIME_FIELDS.items():
-        if _field_provided(req, field):
-            _set_env_override_unlocked(env_name, _env_override_from_value(env_name, getattr(req, field)))
+        field_provided = request_retries_provided if field == "request_failure_retries" else _field_provided(req, field)
+        if field_provided:
+            value = request_retries if field == "request_failure_retries" else getattr(req, field)
+            override = _env_override_from_value(env_name, value)
+            _set_env_override_unlocked(env_name, override)
+            if field in _SECRET_RUNTIME_FIELDS:
+                if override is None:
+                    _runtime_secret_override_fields.discard(field)
+                else:
+                    _runtime_secret_override_fields.add(field)
             cache_needs_clear = True
     if _field_provided(req, "chat_model"):
         llm_module.CHAT_MODEL_OVERRIDE = _chat_model_override_from_value(req.chat_model)
@@ -238,11 +255,13 @@ def _apply_settings_unlocked(req: SettingsUpdateModel) -> bool:
 
 
 def _persisted_settings_after_update_unlocked(req: SettingsUpdateModel) -> SettingsUpdateModel:
-    payload = _runtime_settings_unlocked().model_dump()
+    payload = _runtime_settings_unlocked().model_dump(exclude={"chat_api_key", "summary_api_key"})
     payload["chat_model"] = llm_module.CHAT_MODEL_OVERRIDE
     payload["summary_model"] = _summary_model_override
     payload["chat_timeout"] = llm_module.CHAT_TIMEOUT_OVERRIDE
     for field, env_name in _ENV_RUNTIME_FIELDS.items():
+        if field in _SECRET_RUNTIME_FIELDS and field not in _runtime_secret_override_fields:
+            continue
         payload[field] = _env_override_from_value(env_name, getattr(_runtime_settings_unlocked(), field))
     if req.system_prompt is not None:
         payload["system_prompt"] = req.system_prompt
@@ -252,9 +271,12 @@ def _persisted_settings_after_update_unlocked(req: SettingsUpdateModel) -> Setti
         payload["max_history_messages"] = req.max_history_messages
     if _field_provided(req, "chat_model"):
         payload["chat_model"] = _chat_model_override_from_value(req.chat_model)
+    request_retries_provided, request_retries = _request_failure_retries_update(req)
     for field, env_name in _ENV_RUNTIME_FIELDS.items():
-        if _field_provided(req, field):
-            payload[field] = _env_override_from_value(env_name, getattr(req, field))
+        field_provided = request_retries_provided if field == "request_failure_retries" else _field_provided(req, field)
+        if field_provided:
+            value = request_retries if field == "request_failure_retries" else getattr(req, field)
+            payload[field] = _env_override_from_value(env_name, value)
     if _field_provided(req, "summary_model"):
         payload["summary_model"] = _summary_model_override_from_value(req.summary_model)
     if _field_provided(req, "chat_timeout"):
@@ -269,6 +291,10 @@ def _persisted_settings_after_update_unlocked(req: SettingsUpdateModel) -> Setti
 def _save_settings_unlocked(payload: SettingsUpdateModel) -> None:
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     data = payload.model_dump()
+    if payload.chat_api_key is None:
+        data.pop("chat_api_key", None)
+    if payload.summary_api_key is None:
+        data.pop("summary_api_key", None)
     temp_path = SETTINGS_PATH.with_suffix(SETTINGS_PATH.suffix + ".tmp")
     try:
         temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -385,6 +411,7 @@ def reset_settings() -> SettingsResponseModel:
         agent_module.MAX_ROUNDS = _DEFAULT_MAX_ROUNDS
         agent_module.MAX_HISTORY_MESSAGES = _DEFAULT_MAX_HISTORY_MESSAGES
         agent_module.ENABLED_TOOLS = list(_DEFAULT_ENABLED_TOOLS)
+        _runtime_secret_override_fields.clear()
         llm_module.CHAT_MODEL_OVERRIDE = None
         llm_module.CHAT_TIMEOUT_OVERRIDE = None
         llm_module.CHAT_TEMPERATURE = _DEFAULT_CHAT_TEMPERATURE

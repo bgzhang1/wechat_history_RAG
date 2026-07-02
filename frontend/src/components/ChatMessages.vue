@@ -48,7 +48,10 @@
           </template>
         </div>
         <div class="message-content">
-          <div class="message-role">{{ msg.role === 'user' ? '你' : 'AI 助手' }}</div>
+          <div class="message-role">
+            <span>{{ msg.role === 'user' ? '你' : 'AI 助手' }}</span>
+            <span v-if="formatMessageTime(msg.created_at)" class="message-time">{{ formatMessageTime(msg.created_at) }}</span>
+          </div>
           <div v-if="msg.role === 'user'" class="message-text">{{ msg.content }}</div>
           <template v-else>
             <details v-if="hasThinking(msg.reasoning_content)" class="thinking-panel">
@@ -112,9 +115,9 @@
               <span class="thinking-dot thinking-active"></span>
               <span>思考过程</span>
             </summary>
-            <div class="thinking-content markdown-body" v-html="renderMarkdown(streamingThinking)"></div>
+            <div class="thinking-content markdown-body" v-html="renderStreamingMarkdown(streamingThinking)"></div>
           </details>
-          <div class="message-text markdown-body" v-html="renderMarkdown(streamingText)"></div>
+          <div class="message-text markdown-body" v-html="renderStreamingMarkdown(streamingText)"></div>
           <span class="typing-cursor"></span>
         </div>
       </div>
@@ -180,10 +183,39 @@ const STICKY_SCROLL_THRESHOLD = 96
 const TOOL_PREVIEW_LIMIT = 140
 const TOOL_DETAIL_LIMIT = 1600
 const TOOL_ERROR_PREFIXES = ['错误：', '工具执行错误：', '工具参数不是合法 JSON']
+const MARKDOWN_CACHE_LIMIT = 400
+
+// 历史消息内容不变，缓存渲染结果；否则每个流式 chunk 都会触发
+// 所有历史消息的 marked 全量重解析 + DOMPurify 清洗，长对话时明显卡顿
+const markdownCache = new Map()
 
 function renderMarkdown(text) {
   if (!text) return ''
+  const cached = markdownCache.get(text)
+  if (cached !== undefined) return cached
+  const html = DOMPurify.sanitize(marked.parse(text), MARKDOWN_SANITIZE_CONFIG)
+  if (markdownCache.size >= MARKDOWN_CACHE_LIMIT) {
+    markdownCache.delete(markdownCache.keys().next().value)
+  }
+  markdownCache.set(text, html)
+  return html
+}
+
+// 流式文本每个 chunk 都在变化，缓存无意义且会冲刷缓存容量，直接渲染
+function renderStreamingMarkdown(text) {
+  if (!text) return ''
   return DOMPurify.sanitize(marked.parse(text), MARKDOWN_SANITIZE_CONFIG)
+}
+
+function formatMessageTime(iso) {
+  if (!iso) return ''
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  const now = new Date()
+  const sameDay = date.toDateString() === now.toDateString()
+  const time = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  if (sameDay) return time
+  return `${date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })} ${time}`
 }
 
 function hasThinking(value) {
@@ -473,12 +505,29 @@ watch(
 }
 
 .message-role {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
   font-size: var(--text-xs);
   font-weight: 600;
   color: var(--text-muted);
   margin-bottom: var(--space-1);
   text-transform: uppercase;
   letter-spacing: 0;
+}
+
+.message-user .message-role {
+  justify-content: flex-end;
+}
+
+.message-time {
+  font-weight: 400;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.message:hover .message-time {
+  opacity: 1;
 }
 
 .message-text {

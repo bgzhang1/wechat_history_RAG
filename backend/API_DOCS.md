@@ -46,11 +46,12 @@
 ```json
 {
   "question": "搜索一下上个月我和张三讨论了什么关于旅游的事情",
-  "session_id": "可选；已有会话 ID，不传则自动创建"
+  "session_id": "可选；已有会话 ID，不传则自动创建",
+  "effort": "可选；本次提问的检索努力档位 low / medium / high / max，留空使用后端全局档位"
 }
 ```
 
-`question` 会去掉首尾空白，长度范围为 `1-8000`；`session_id` 如传入也会去掉首尾空白，长度范围为 `1-120`。
+`question` 会去掉首尾空白，长度范围为 `1-8000`；`session_id` 如传入也会去掉首尾空白，长度范围为 `1-120`；`effort` 大小写不敏感，非法取值返回 422。
 
 响应类型：`text/event-stream`
 
@@ -66,11 +67,14 @@ data: {"name":"search_messages","args":"{\"query\":\"旅游\"}"}
 event: tool_result
 data: {"name":"search_messages","summary":"命中 23 条消息，返回 20 条"}
 
+event: thinking
+data: {"chunk":"模型返回的 reasoning/thinking 片段；不支持时不会出现"}
+
 event: text
 data: {"chunk":"上个月你们主要聊到..."}
 
 event: done
-data: {"answer":"上个月你们主要聊到...","session_id":"b0f7e..."}
+data: {"answer":"上个月你们主要聊到...","thinking":"...","session_id":"b0f7e..."}
 ```
 
 SSE 事件：
@@ -78,10 +82,11 @@ SSE 事件：
 | 事件 | 说明 |
 |---|---|
 | `session` | 本轮使用的会话 ID；新会话第一时间可拿到它，用于停止生成 |
+| `thinking` | 模型返回的 reasoning/thinking 片段；只有模型或兼容服务提供该内容时才会出现 |
 | `tool_call` | Agent 准备调用检索工具 |
 | `tool_result` | 检索工具完成，并返回摘要 |
 | `text` | 模型输出片段 |
-| `done` | 本轮完成，返回完整回答和 `session_id` |
+| `done` | 本轮完成，返回完整回答、完整 `thinking` 和 `session_id` |
 | `error` | Agent 执行失败 |
 
 ### 1.2 停止生成
@@ -170,17 +175,21 @@ SSE 事件：
       "id": 1,
       "role": "user",
       "content": "你好",
+      "reasoning_content": null,
       "created_at": "2026-06-17T08:00:00Z"
     },
     {
       "id": 2,
       "role": "assistant",
       "content": "你好，有什么想查的聊天记录？",
+      "reasoning_content": "",
       "created_at": "2026-06-17T08:00:02Z"
     }
   ]
 }
 ```
+
+`reasoning_content` 保存本轮助手回答对应的完整 thinking/reasoning 内容；模型或兼容服务不提供该内容时通常为空。
 
 ### 2.3 获取会话状态
 
@@ -274,12 +283,33 @@ SSE 事件：
   "system_prompt": "你是微信聊天记录检索助手...",
   "max_rounds": 12,
   "max_history_messages": 40,
+  "chat_base_url": "https://api.example.com/v1",
   "chat_model": "gpt-4o",
+  "chat_reasoning_effort": "",
+  "request_failure_retries": 3,
+  "request_failure_retry_interval": 5.0,
+  "summary_base_url": "",
   "summary_model": "gpt-4o-mini",
+  "summary_reasoning_effort": "",
+  "summary_workers": 2,
+  "summary_batch_size": 4,
+  "summary_max_chars": 3000,
+  "summary_fallback_chars": 1200,
+  "embed_base_url": "https://api.example.com/v1",
+  "embed_model": "text-embedding-3-small",
+  "embed_timeout": 90.0,
+  "embed_workers": 4,
+  "embed_batch_size": 32,
   "chat_timeout": 300.0,
   "chat_temperature": 0.0,
   "enabled_tools": ["search_messages", "semantic_search", "get_context", "browse_by_time", "get_stats"],
-  "available_tools": ["search_messages", "semantic_search", "get_context", "browse_by_time", "get_stats"]
+  "available_tools": ["search_messages", "semantic_search", "get_context", "browse_by_time", "get_stats"],
+  "chat_api_key_configured": true,
+  "summary_api_key_configured": true,
+  "summary_api_key_inherited": true,
+  "summary_base_url_inherited": true,
+  "summary_reasoning_effort_inherited": true,
+  "embed_api_key_configured": true
 }
 ```
 
@@ -287,12 +317,18 @@ SSE 事件：
 
 `POST /api/settings`
 
-所有字段均可选，只传需要修改的字段。设置页保存的都是非密钥运行时配置，会持久化到 `runtime/backend_settings.json`（可用 `BACKEND_SETTINGS_FILE` 调整路径）；API Key 仍只从 `.env` / 环境变量读取。`chat_model`、`summary_model` 和 `chat_timeout` 只有在不同于当前环境变量值时才作为运行时覆盖值持久化，避免普通保存操作把 `.env` 中的模型配置冻结成旧值。`summary_model` 保存后会作为后续导入子进程的 `SUMMARY_MODEL` 使用。`enabled_tools` 是 Agent 的最终可调用工具白名单，每轮对话会自动把当前启用/停用工具策略追加到系统提示词，避免自定义提示词继续引导模型调用已停用工具。响应中的 `available_tools` 是只读字段，用于前端渲染当前后端注册的工具列表，不会写入持久化设置文件。
+所有字段均可选，只传需要修改的字段。设置页保存的是运行时覆盖配置，会持久化到 `runtime/backend_settings.json`（可用 `BACKEND_SETTINGS_FILE` 调整路径），并在后端重启时重新加载。
+
+`chat_api_key` 和 `summary_api_key` 只用于更新，不会在响应中返回；但如果通过设置页保存了新的 Key，该覆盖值会写入本地运行时设置文件。请把 `runtime/` 当作敏感本地数据处理，不要提交或外发。`chat_model`、`summary_model`、`chat_timeout` 以及各类 Base URL、线程数、批次大小等字段只有在不同于启动时环境变量值时才作为覆盖值持久化，避免普通保存操作把 `.env` 中的配置冻结成旧值。`request_failure_retries` 是对话、摘要和 Embedding 远程 API 请求失败时共用的重试次数；`request_failure_retry_interval` 是基础等待秒数，等待节奏按每 3 次重试递增，例如默认 `5, 5, 5, 10, 10, 10...` 秒。旧请求里的 `chat_max_retries` / `embed_max_retries` 会被兼容合并为该字段。`summary_model` 保存后会作为后续导入子进程的 `SUMMARY_MODEL` 使用。`enabled_tools` 是 Agent 的最终可调用工具白名单，每轮对话会自动把当前启用/停用工具策略追加到系统提示词，避免自定义提示词继续引导模型调用已停用工具。响应中的 `available_tools` 是只读字段，用于前端渲染当前后端注册的工具列表，不会写入持久化设置文件。
 
 ```json
 {
+  "chat_base_url": "https://api.example.com/v1",
+  "chat_api_key": "sk-new-key",
   "chat_temperature": 0.5,
   "chat_timeout": 120,
+  "summary_base_url": "",
+  "summary_api_key": "",
   "enabled_tools": ["search_messages", "semantic_search", "get_context"]
 }
 ```
@@ -306,18 +342,51 @@ SSE 事件：
 | `system_prompt` | 最长 20000 字符 |
 | `max_rounds` | 1-200 |
 | `max_history_messages` | 0-200；为 0 时本轮不携带历史消息 |
+| `chat_base_url` | 最长 500 字符 |
+| `chat_api_key` | 最长 1000 字符，只用于更新，不回显 |
 | `chat_model` | 最长 200 字符 |
+| `chat_reasoning_effort` | 空值或 `low` / `medium` / `high` |
+| `request_failure_retries` | 0-10；对话、摘要和 Embedding 远程 API 请求失败时共用 |
+| `request_failure_retry_interval` | 0-300 秒；默认 5 秒，每 3 次重试递增一档 |
+| `summary_base_url` | 最长 500 字符；空值继承 `CHAT_BASE_URL` |
+| `summary_api_key` | 最长 1000 字符；空值继承 `CHAT_API_KEY` |
 | `summary_model` | 最长 200 字符 |
+| `summary_reasoning_effort` | 空值或 `low` / `medium` / `high`；空值继承对话配置 |
+| `summary_workers` | 1-32 |
+| `summary_batch_size` | 1-128 |
+| `summary_max_chars` | 100-20000 |
+| `summary_fallback_chars` | 0-20000 |
+| `embed_base_url` | 最长 500 字符 |
+| `embed_model` | 最长 200 字符 |
+| `embed_timeout` | 1-1800 秒 |
+| `embed_workers` | 1-64 |
+| `embed_batch_size` | 1-512 |
 | `chat_timeout` | 1-1800 秒 |
 | `chat_temperature` | 0-2 |
 | `enabled_tools` | 至少 1 个，且必须是已知工具名 |
 | `available_tools` | 只读响应字段，列出当前后端已注册工具；更新请求不需要传 |
 
-### 3.3 重置设置
+### 3.3 获取模型列表
+
+`GET /api/settings/models?target=chat`
+
+`target` 可选 `chat` 或 `summary`，默认 `chat`。后端会使用当前生效的 OpenAI 兼容 Base URL 和 API Key 请求 `{base_url}/models`，返回可用模型 ID 列表。
+
+摘要模型列表会优先使用 `SUMMARY_BASE_URL` / `SUMMARY_API_KEY`，缺失时继承对话配置。缺少必要配置时返回 `400`；远端请求失败或响应无法解析时返回 `502`。
+
+响应：
+
+```json
+{
+  "items": ["gpt-4o", "gpt-4o-mini"]
+}
+```
+
+### 3.4 重置设置
 
 `POST /api/settings/reset`
 
-删除持久化运行时设置，恢复代码默认值和 `.env` / 环境变量中的模型配置。
+删除持久化运行时设置，恢复代码默认值和 `.env` / 环境变量中的模型配置。该操作会删除本地 `BACKEND_SETTINGS_FILE`，但不会修改 `.env` 文件本身。
 
 ## 4. 数据统计
 

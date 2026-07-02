@@ -253,8 +253,8 @@
             <div v-if="taskErrorReturnCode(task) != null" class="task-error-meta">
               子进程返回码：{{ taskErrorReturnCode(task) }}
             </div>
-            <div class="task-error-message">
-              原始信息：{{ task.error }}
+            <div v-if="taskErrorMessage(task)" class="task-error-message">
+              详细原因：{{ taskErrorMessage(task) }}
             </div>
           </div>
 
@@ -1010,7 +1010,8 @@ function taskErrorInfo(task) {
 
 function taskErrorTitle(task) {
   const info = taskErrorInfo(task)
-  return info?.type || '未知错误'
+  if (info?.type && info.type !== '导入失败') return info.type
+  return taskFailureHeadline(task) || info?.type || '未知错误'
 }
 
 function taskErrorCode(task) {
@@ -1028,11 +1029,26 @@ function taskErrorReturnCode(task) {
   return info?.return_code ?? null
 }
 
+function taskErrorMessage(task) {
+  const info = taskErrorInfo(task)
+  return task?.error || info?.message || ''
+}
+
+function taskFailureHeadline(task) {
+  const detail = String(taskErrorMessage(task) || '')
+    .replace(/^ingest exited with code\s+\d+:\s*/i, '')
+    .trim()
+  if (!detail) return ''
+  const headline = detail.split(/[；;]/)[0]
+  return headline.length > 80 ? `${headline.slice(0, 80)}...` : headline
+}
+
 function taskFailureSummary(task) {
   if (!task) return '失败'
   const info = task.error_info || null
   const code = info?.code ? `（${info.code}）` : ''
-  return `${info?.type || taskStatusLabel(task.status)}${code}: ${task.error || info?.message || taskStatusLabel(task.status)}`
+  const message = taskErrorMessage(task) || taskStatusLabel(task.status)
+  return `${info?.type || taskStatusLabel(task.status)}${code}: ${message}`
 }
 
 function taskFileLabel(task) {
@@ -1619,6 +1635,10 @@ function importButtonLabel(file) {
   justify-content: space-between;
   gap: var(--space-2);
   font-weight: 600;
+}
+
+.task-error-title span:first-child {
+  min-width: 0;
 }
 
 .task-error-code {

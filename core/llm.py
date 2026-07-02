@@ -13,6 +13,8 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 load_dotenv()
 
 DEFAULT_API_ATTEMPTS = 3
+DEFAULT_REQUEST_FAILURE_RETRIES = 3
+DEFAULT_REQUEST_FAILURE_RETRY_INTERVAL = 5.0
 T = TypeVar("T")
 
 
@@ -24,6 +26,17 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
         value = int(raw)
     except ValueError:
         return default
+    return max(minimum, value)
+
+
+def _env_optional_int(name: str, minimum: int = 0) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
     return max(minimum, value)
 
 
@@ -45,6 +58,72 @@ def _retry_attempts(name: str, default: int = DEFAULT_API_ATTEMPTS) -> int:
     return _env_int(name, default, minimum=1)
 
 
+def request_failure_retries(default: int = DEFAULT_REQUEST_FAILURE_RETRIES) -> int:
+    configured = _env_optional_int("REQUEST_FAILURE_RETRIES", minimum=0)
+    if configured is not None:
+        return configured
+
+    legacy_values = [
+        value
+        for value in (
+            _env_optional_int("CHAT_MAX_RETRIES", minimum=0),
+            _env_optional_int("EMBED_MAX_RETRIES", minimum=0),
+            _legacy_local_retry_count("CHAT_LOCAL_RETRIES"),
+            _legacy_local_retry_count("SUMMARY_LOCAL_RETRIES"),
+            _legacy_local_retry_count("EMBED_LOCAL_RETRIES"),
+        )
+        if value is not None
+    ]
+    if legacy_values:
+        return max(legacy_values)
+    return default
+
+
+def _env_optional_float(name: str, minimum: float = 0.0) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return max(minimum, value)
+
+
+def _legacy_local_retry_count(name: str) -> int | None:
+    attempts = _env_optional_int(name, minimum=1)
+    return None if attempts is None else max(0, attempts - 1)
+
+
+def request_failure_retry_interval(default: float = DEFAULT_REQUEST_FAILURE_RETRY_INTERVAL) -> float:
+    configured = _env_optional_float("REQUEST_FAILURE_RETRY_INTERVAL", minimum=0.0)
+    if configured is not None:
+        return configured
+
+    legacy_values = [
+        value
+        for value in (
+            _env_optional_float("CHAT_RETRY_SLEEP", minimum=0.0),
+            _env_optional_float("SUMMARY_RETRY_SLEEP", minimum=0.0),
+            _env_optional_float("EMBED_RETRY_SLEEP", minimum=0.0),
+        )
+        if value is not None
+    ]
+    if legacy_values:
+        return max(legacy_values)
+    return default
+
+
+def request_failure_retry_delay(retry_number: int, base_interval: float | None = None) -> float:
+    try:
+        retry = int(retry_number)
+    except (TypeError, ValueError, OverflowError):
+        retry = 1
+    retry = max(1, retry)
+    interval = request_failure_retry_interval() if base_interval is None else max(0.0, float(base_interval))
+    return interval * (((retry - 1) // 3) + 1)
+
+
 def _positive_int_value(value: Any, default: int) -> int:
     try:
         parsed = int(value)
@@ -55,17 +134,41 @@ def _positive_int_value(value: Any, default: int) -> int:
 
 def _remote_api_call(
     call: Callable[[], T],
-    attempts: int,
-    retry_sleep: float,
+    retries: int | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> T:
-    for attempt in range(attempts):
+    max_retries = request_failure_retries() if retries is None else max(0, int(retries))
+    for attempt in range(max_retries + 1):
         try:
             return call()
         except Exception:
-            if attempt + 1 >= attempts:
+            if attempt >= max_retries:
                 raise
-            if retry_sleep:
-                time.sleep(retry_sleep * (attempt + 1))
+            delay = request_failure_retry_delay(attempt + 1)
+            if delay:
+                sleep(delay)
+    raise RuntimeError("remote API retry loop exited unexpectedly")
+
+
+def _remote_api_stream(
+    call: Callable[[], Any],
+    retries: int | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    max_retries = request_failure_retries() if retries is None else max(0, int(retries))
+    for attempt in range(max_retries + 1):
+        emitted = False
+        try:
+            for item in call():
+                emitted = True
+                yield item
+            return
+        except Exception:
+            if emitted or attempt >= max_retries:
+                raise
+            delay = request_failure_retry_delay(attempt + 1)
+            if delay:
+                sleep(delay)
     raise RuntimeError("remote API retry loop exited unexpectedly")
 
 
@@ -241,16 +344,21 @@ def chat_model(model: str | None = None) -> ChatOpenAI:
         _env_config_value("CHAT_API_KEY"),
         actual_timeout,
         CHAT_TEMPERATURE,
-        _env_int("CHAT_MAX_RETRIES", 3, minimum=0),
+        0,
         _chat_reasoning_effort(),
     )
 
 
-def invoke_chat(input: Any, model: str | None = None) -> Any:
+def invoke_chat(input: Any, model: str | None = None, tools: list[Any] | None = None) -> Any:
     client = chat_model(model)
-    attempts = _retry_attempts("CHAT_LOCAL_RETRIES")
-    retry_sleep = _env_float("CHAT_RETRY_SLEEP", 1.0, minimum=0.0)
-    return _remote_api_call(lambda: client.invoke(input), attempts, retry_sleep)
+    if tools is not None:
+        client = client.bind_tools(tools)
+    return _remote_api_call(lambda: client.invoke(input))
+
+
+def stream_chat(input: Any, model: str | None = None) -> Any:
+    client = chat_model(model)
+    return _remote_api_stream(lambda: client.stream(input))
 
 
 def summary_model(model: str | None = None) -> ChatOpenAI:
@@ -269,16 +377,14 @@ def summary_model(model: str | None = None) -> ChatOpenAI:
         _summary_api_key(),
         actual_timeout,
         CHAT_TEMPERATURE,
-        _env_int("CHAT_MAX_RETRIES", 3, minimum=0),
+        0,
         _summary_reasoning_effort(),
     )
 
 
 def invoke_summary(input: Any, model: str | None = None) -> Any:
     client = summary_model(model)
-    attempts = _retry_attempts("SUMMARY_LOCAL_RETRIES", _retry_attempts("CHAT_LOCAL_RETRIES"))
-    retry_sleep = _env_float("SUMMARY_RETRY_SLEEP", _env_float("CHAT_RETRY_SLEEP", 1.0, minimum=0.0), minimum=0.0)
-    return _remote_api_call(lambda: client.invoke(input), attempts, retry_sleep)
+    return _remote_api_call(lambda: client.invoke(input))
 
 
 @lru_cache(maxsize=2)
@@ -308,7 +414,7 @@ def embed_model() -> OpenAIEmbeddings:
         _env_config_value("EMBED_BASE_URL"),
         _env_config_value("EMBED_API_KEY"),
         _env_float("EMBED_TIMEOUT", 90.0, minimum=1.0),
-        _env_int("EMBED_MAX_RETRIES", 0, minimum=0),
+        0,
     )
 
 
@@ -318,16 +424,12 @@ def embed(texts: list[str], batch_size: int = 32) -> list[list[float]]:
     safe_batch_size = _positive_int_value(batch_size, 32)
     embeddings = embed_model()
     output: list[list[float]] = []
-    local_retries = _retry_attempts("EMBED_LOCAL_RETRIES")
-    retry_sleep = _env_float("EMBED_RETRY_SLEEP", 1.0, minimum=0.0)
 
     for start in range(0, len(texts), safe_batch_size):
         batch = texts[start : start + safe_batch_size]
         output.extend(
             _remote_api_call(
                 lambda batch=batch: embeddings.embed_documents(batch),
-                local_retries,
-                retry_sleep,
             )
         )
 

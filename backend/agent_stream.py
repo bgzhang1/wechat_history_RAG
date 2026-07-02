@@ -152,6 +152,7 @@ def stream_agent(
     question: str,
     chat_history: list[BaseMessage],
     session_id: str,
+    effort: str | None = None,
 ) -> Generator[str, None, None]:
     """
     Run the agent loop, yielding SSE-formatted events:
@@ -184,8 +185,9 @@ def stream_agent(
         yield _sse("error", {"detail": public_exception_message("Agent 初始化失败", exc)})
         return
 
+    level, max_rounds, max_nudges = agent_module._resolve_effort(effort)
     working_messages: list[BaseMessage] = [
-        SystemMessage(content=agent_module.build_system_prompt()),
+        SystemMessage(content=agent_module.build_system_prompt(level)),
         *chat_history,
         HumanMessage(content=question),
     ]
@@ -193,9 +195,10 @@ def stream_agent(
     full_answer = ""
     full_thinking = ""
     nudge_count = 0
+    executed_signatures: set[str] = set()
 
     try:
-        for _round in range(agent_module.MAX_ROUNDS):
+        for _round in range(max_rounds):
             if _is_aborted(session_id):
                 full_answer = ABORTED_ANSWER
                 yield _sse("text", {"chunk": full_answer})
@@ -248,7 +251,7 @@ def stream_agent(
                         )
                         yield _sse("text", {"chunk": full_answer})
                 elif not text and not has_tools:
-                    if nudge_count < agent_module.MAX_NUDGES and _round < agent_module.MAX_ROUNDS - 1:
+                    if nudge_count < max_nudges and _round < max_rounds - 1:
                         nudge_count += 1
                         nudge = agent_module.NO_TOOL_NUDGE.format(question=question)
                         full_answer = ""
@@ -259,7 +262,7 @@ def stream_agent(
                     full_answer = "模型未调用检索工具且返回了空回答，本轮已停止。请确认已导入聊天记录后重试。"
                     yield _sse("text", {"chunk": full_answer})
                 elif agent_module._looks_like_giving_up(text, has_tool_results=has_tools):
-                    if nudge_count < agent_module.MAX_NUDGES and _round < agent_module.MAX_ROUNDS - 1:
+                    if nudge_count < max_nudges and _round < max_rounds - 1:
                         nudge_count += 1
                         if not has_tools:
                             nudge = agent_module.NO_TOOL_NUDGE.format(question=question)
@@ -292,7 +295,7 @@ def stream_agent(
                 yield _sse("tool_call", {"name": tool_name, "args": args_preview})
                 print(f"  [tool] {tool_name}({args_preview[:120]})", file=sys.stderr)
 
-                tool_msg = agent_module._run_tool_call(tool_call)
+                tool_msg = agent_module._run_tool_call(tool_call, executed_signatures)
                 working_messages.append(tool_msg)
 
                 if _is_aborted(session_id):
@@ -312,10 +315,37 @@ def stream_agent(
             if aborted_during_tools:
                 break
         else:
-            full_answer = (
-                "已达到单次提问的工具调用轮数上限。请缩小时间、人物或关键词范围后重试。"
-            )
-            yield _sse("text", {"chunk": full_answer})
+            # 轮数耗尽：已有工具结果时强制综合作答，而不是丢弃全部检索成果
+            if agent_module._has_tool_calls_in_history(working_messages) and not _is_aborted(session_id):
+                synth_messages = [
+                    *working_messages,
+                    HumanMessage(content=f"用户原问题：{question}\n\n{agent_module.EXHAUSTED_NUDGE}"),
+                ]
+                try:
+                    for chunk in stream_chat(synth_messages):
+                        if _is_aborted(session_id):
+                            full_answer = (
+                                ABORTED_ANSWER
+                                if not full_answer
+                                else f"{full_answer}\n{ABORTED_ANSWER}"
+                            )
+                            yield _sse("text", {"chunk": ABORTED_ANSWER})
+                            break
+                        thinking_piece = _message_reasoning(chunk)
+                        if thinking_piece:
+                            full_thinking += thinking_piece
+                            yield _sse("thinking", {"chunk": thinking_piece})
+                        piece = _message_text(chunk)
+                        if piece:
+                            full_answer += piece
+                            yield _sse("text", {"chunk": piece})
+                except Exception:
+                    full_answer = ""
+            if not full_answer:
+                full_answer = (
+                    "已达到单次提问的工具调用轮数上限。请缩小时间、人物或关键词范围后重试。"
+                )
+                yield _sse("text", {"chunk": full_answer})
 
     except Exception as exc:
         yield _sse("error", {"detail": public_exception_message("Agent 执行失败", exc)})

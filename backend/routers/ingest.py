@@ -53,6 +53,56 @@ TASK_PROGRESS_LOG_CHARS = 20000
 MAX_INGEST_TARGET_CHARS = 2048
 ETA_STALE_PROGRESS_SECONDS = _env_int("INGEST_ETA_STALE_SECONDS", 120, minimum=10)
 PROGRESS_PREFIX = "__INGEST_PROGRESS__ "
+GENERIC_FAILURE_MESSAGE_RE = re.compile(r"^[\w\s./_-]{1,80}(?:失败|failed)$", re.IGNORECASE)
+FAILURE_LOG_HINT_PREFIXES = ("修复", "重跑", "建议", "可按需")
+FAILURE_DIAGNOSTIC_KEYWORDS = (
+    "traceback",
+    "error",
+    "exception",
+    "failed",
+    "failure",
+    "badrequest",
+    "unprocessable",
+    "rejected",
+    "rate limit",
+    "too many requests",
+    "quota",
+    "timeout",
+    "timed out",
+    "readtimeout",
+    "401",
+    "403",
+    "404",
+    "429",
+    "400",
+    "422",
+    "500",
+    "connection",
+    "connect",
+    "dns",
+    "getaddrinfo",
+    "max retries exceeded",
+    "name resolution",
+    "nameresolutionerror",
+    "proxy",
+    "ssl",
+    "certificate",
+    "sqlite",
+    "database",
+    "permission",
+    "no space",
+    "out of memory",
+    "错误",
+    "异常",
+    "失败",
+    "拒绝",
+    "限流",
+    "超时",
+    "未配置",
+    "不存在",
+    "不可用",
+    "维度",
+)
 
 _tasks: dict[str, dict[str, Any]] = {}
 _tasks_lock = threading.RLock()
@@ -399,9 +449,9 @@ def _classify_ingest_error(error: str, *, mode: str = "incremental", return_code
             "在设置的高级设置中检查 Embedding Base URL、模型和线程批次；API Key 仍需在本地环境变量中配置。",
         ),
         (
-            ("summary_model", "summary", "摘要模型", "仅摘要"),
-            "SUMMARY_CONFIG_MISSING" if mode == "summary" else "SUMMARY_ERROR",
-            "摘要配置或生成失败",
+            ("summary_model", "未配置 summary_model", "摘要模型尚未配置"),
+            "SUMMARY_CONFIG_MISSING",
+            "摘要配置缺失",
             "在设置中检查摘要模型、聊天 Base URL 和摘要线程批次；如果涉及 API Key，请检查本地环境变量。",
         ),
         (
@@ -411,10 +461,44 @@ def _classify_ingest_error(error: str, *, mode: str = "incremental", return_code
             "降低线程数或批次大小，等待额度恢复后重试。",
         ),
         (
+            ("401", "403", "unauthorized", "forbidden", "invalid api key", "incorrect api key", "api key", "authentication", "鉴权", "认证", "无权限"),
+            "MODEL_AUTH_ERROR",
+            "模型认证失败",
+            "检查对应模型服务的 API Key、环境变量和运行时设置，确认 Key 未过期且有访问权限。",
+        ),
+        (
             ("timeout", "timed out", "超时", "readtimeout"),
             "MODEL_TIMEOUT",
             "模型请求超时",
             "适当增大超时时间，或降低线程数、批次大小后重试。",
+        ),
+        (
+            (
+                "connecterror",
+                "connectionerror",
+                "connection",
+                "connect",
+                "dns",
+                "getaddrinfo",
+                "max retries exceeded",
+                "name resolution",
+                "nameresolutionerror",
+                "proxy",
+                "ssl",
+                "certificate",
+                "network",
+                "网络",
+                "连接",
+            ),
+            "MODEL_CONNECTION_ERROR",
+            "模型连接失败",
+            "检查 Base URL、网络代理、防火墙和证书配置，确认后端可以访问模型服务。",
+        ),
+        (
+            ("model not found", "model_not_found", "does not exist", "not found", "404", "模型不存在", "模型未找到"),
+            "MODEL_NOT_FOUND",
+            "模型不存在",
+            "检查模型名称是否拼写正确，并确认该 API Key 或 Base URL 下可以访问该模型。",
         ),
         (
             ("badrequest", "bad request", "unprocessable", "400", "422", "rejected", "拒绝"),
@@ -452,6 +536,12 @@ def _classify_ingest_error(error: str, *, mode: str = "incremental", return_code
             "索引或数据库错误",
             "检查数据库健康状态和 sqlite-vec 可用性，必要时重建索引。",
         ),
+        (
+            ("summary", "摘要生成", "摘要模型", "仅摘要"),
+            "SUMMARY_CONFIG_MISSING" if mode == "summary" else "SUMMARY_ERROR",
+            "摘要配置或生成失败",
+            "在设置中检查摘要模型、聊天 Base URL 和摘要线程批次；如果涉及 API Key，请检查本地环境变量。",
+        ),
     ]
     for keywords, code, type_label, action in rules:
         if any(keyword in text for keyword in keywords):
@@ -473,19 +563,55 @@ def _task_failure_detail(task_id: str) -> str:
             return ""
 
         progress_message = _failure_progress_message(task.get("progress_event"))
-        if progress_message:
+        if progress_message and not _is_generic_failure_message(progress_message):
             return progress_message
 
         log_tail = _task_log_tail(task, TASK_LOG_TAIL_CHARS)
 
+    log_detail = _failure_log_detail(log_tail)
+    if log_detail:
+        return log_detail
+    if progress_message:
+        return progress_message
+    return ""
+
+
+def _failure_log_detail(log_tail: str) -> str:
+    fallback = ""
     for raw_line in reversed(log_tail.splitlines()):
         line = raw_line.strip()
-        if not line or line.startswith(PROGRESS_PREFIX) or line == "...[line truncated]":
+        if _skip_failure_log_line(line):
             continue
         detail = redact_text(line, limit=500)
         if detail:
-            return detail
-    return ""
+            if _is_failure_diagnostic_line(line):
+                return detail
+            if not fallback:
+                fallback = detail
+    return fallback
+
+
+def _skip_failure_log_line(line: str) -> bool:
+    if not line or line.startswith(PROGRESS_PREFIX) or line == "...[line truncated]":
+        return True
+    return line.startswith(FAILURE_LOG_HINT_PREFIXES)
+
+
+def _is_failure_diagnostic_line(line: str) -> bool:
+    text = line.lower()
+    return any(keyword in text for keyword in FAILURE_DIAGNOSTIC_KEYWORDS)
+
+
+def _is_generic_failure_message(message: str) -> bool:
+    text = message.strip()
+    if not text:
+        return True
+    if any(marker in text for marker in (":", "：", "(", "（", ";", "；", "×")):
+        return False
+    if GENERIC_FAILURE_MESSAGE_RE.fullmatch(text):
+        return True
+    generic_messages = {"导入失败", "摘要生成失败", "摘要生成 失败", "embedding 生成失败", "embedding 生成 失败", "embedding 写入失败", "embedding 写入 失败"}
+    return text in generic_messages
 
 
 def _failure_progress_message(event: Any) -> str:

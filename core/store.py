@@ -1284,6 +1284,40 @@ def _query_terms(value: Any) -> tuple[list[str], bool]:
     return raw_terms[:MAX_QUERY_TERMS], truncated
 
 
+_CJK_CHAR_RE = re.compile(r"[一-鿿]")
+_TERM_PIECE_RE = re.compile(r"[^0-9A-Za-z一-鿿]+")
+SEMANTIC_FTS_MAX_TERMS = 12
+
+
+def _semantic_fts_terms(query: str) -> list[str]:
+    """把自然语言查询拆成适合 trigram FTS 的短词。
+
+    中文长句整体当作一个短语去 MATCH 几乎必然 0 命中；按标点/非文字符号分段后，
+    超过 4 字且含中文的片段再拆成滑动 trigram（步长 2、末尾补齐），
+    配合调用方的 OR 匹配 + 命中数排序换取召回。
+    """
+    raw_terms, _truncated = _query_terms(query)
+    pieces: list[str] = []
+    for term in raw_terms:
+        pieces.extend(piece for piece in _TERM_PIECE_RE.split(term) if piece)
+    if not pieces:
+        return []
+    longest = max(len(piece) for piece in pieces)
+    expanded: list[str] = []
+    for piece in pieces:
+        if len(piece) == 1 and longest > 1:
+            # 单字符片段在 OR 匹配下噪声过大，有更长片段时直接丢弃
+            continue
+        if len(piece) > 4 and _CJK_CHAR_RE.search(piece):
+            starts = list(range(0, len(piece) - 2, 2))
+            if starts and starts[-1] != len(piece) - 3:
+                starts.append(len(piece) - 3)
+            expanded.extend(piece[start : start + 3] for start in starts)
+        else:
+            expanded.append(piece)
+    return list(dict.fromkeys(expanded))[:SEMANTIC_FTS_MAX_TERMS]
+
+
 def _filter_clauses(filters: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
     where: list[str] = []
     params: dict[str, Any] = {}
@@ -1383,6 +1417,68 @@ def _to_preview_msg(row: sqlite3.Row | dict[str, Any], highlight_terms: list[str
     }
 
 
+def _fts_match_expr(terms: list[str], operator: str) -> str:
+    return f" {operator} ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+
+
+def _search_messages_fts(
+    conn: sqlite3.Connection,
+    terms: list[str],
+    where: list[str],
+    params: dict[str, Any],
+    limit: int,
+    offset: int,
+    operator: str,
+) -> tuple[int, list[sqlite3.Row]]:
+    cond = " AND ".join(["messages_fts MATCH :match", *where])
+    base = f"FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid WHERE {cond}"
+    all_params = {**params, "match": _fts_match_expr(terms, operator), "limit": limit, "offset": offset}
+    total = int(conn.execute(f"SELECT COUNT(*) c {base}", all_params).fetchone()["c"])
+    rows = conn.execute(
+        f"""
+        SELECT m.*, bm25(messages_fts) rank {base}
+        ORDER BY rank, m.timestamp DESC, m.id DESC
+        LIMIT :limit OFFSET :offset
+        """,
+        all_params,
+    ).fetchall()
+    return total, rows
+
+
+def _search_messages_like(
+    conn: sqlite3.Connection,
+    terms: list[str],
+    where: list[str],
+    params: dict[str, Any],
+    limit: int,
+    offset: int,
+    operator: str,
+) -> tuple[int, list[sqlite3.Row]]:
+    likes: list[str] = []
+    hit_exprs: list[str] = []
+    all_params = {**params, "limit": limit, "offset": offset}
+    for idx, term in enumerate(terms):
+        clause = f"m.content LIKE '%' || :q{idx} || '%' ESCAPE '\\'"
+        likes.append(clause)
+        hit_exprs.append(f"(CASE WHEN {clause} THEN 1 ELSE 0 END)")
+        all_params[f"q{idx}"] = _escape_like(term)
+    cond = " AND ".join([f"({f' {operator} '.join(likes)})", *where])
+    base = f"FROM messages m WHERE {cond}"
+    total = int(conn.execute(f"SELECT COUNT(*) c {base}", all_params).fetchone()["c"])
+    order = "m.timestamp DESC, m.id DESC"
+    if operator == "OR" and len(terms) > 1:
+        # OR 放宽后按命中关键词数排序，多词命中的消息优先
+        order = f"({' + '.join(hit_exprs)}) DESC, {order}"
+    rows = conn.execute(
+        f"SELECT m.* {base} ORDER BY {order} LIMIT :limit OFFSET :offset",
+        all_params,
+    ).fetchall()
+    return total, rows
+
+
+LONG_TERM_HINT_CHARS = 8
+
+
 def search_messages(args: dict[str, Any]) -> dict[str, Any]:
     conn = db()
     limit = _safe_int(args.get("limit"), 20, minimum=1, maximum=100)
@@ -1398,35 +1494,20 @@ def search_messages(args: dict[str, Any]) -> dict[str, Any]:
             "note": "query is empty; provide at least one keyword",
             "messages": [],
         }
-    use_fts = bool(terms) and all(len(term) >= 3 for term in terms)
+    use_fts = all(len(term) >= 3 for term in terms)
+    search_once = _search_messages_fts if use_fts else _search_messages_like
 
-    if use_fts:
-        match = " AND ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
-        cond = " AND ".join(["messages_fts MATCH :match", *where])
-        base = f"FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid WHERE {cond}"
-        all_params = {**params, "match": match, "limit": limit, "offset": offset}
-        total = conn.execute(f"SELECT COUNT(*) c {base}", all_params).fetchone()["c"]
-        rows = conn.execute(
-            f"""
-            SELECT m.*, bm25(messages_fts) rank {base}
-            ORDER BY rank, m.timestamp DESC, m.id DESC
-            LIMIT :limit OFFSET :offset
-            """,
-            all_params,
-        ).fetchall()
-    else:
-        likes = []
-        for idx, term in enumerate(terms):
-            likes.append(f"m.content LIKE '%' || :q{idx} || '%' ESCAPE '\\'")
-            params[f"q{idx}"] = _escape_like(term)
-        cond = " AND ".join([*likes, *where]) or "1=1"
-        base = f"FROM messages m WHERE {cond}"
-        all_params = {**params, "limit": limit, "offset": offset}
-        total = conn.execute(f"SELECT COUNT(*) c {base}", all_params).fetchone()["c"]
-        rows = conn.execute(
-            f"SELECT m.* {base} ORDER BY m.timestamp DESC, m.id DESC LIMIT :limit OFFSET :offset",
-            all_params,
-        ).fetchall()
+    notes: list[str] = []
+    total, rows = search_once(conn, terms, where, params, limit, offset, "AND")
+    if total == 0 and len(terms) > 1:
+        # 聊天消息很短，多关键词同条 AND 命中率低；自动放宽为 OR 兜底召回
+        total, rows = search_once(conn, terms, where, params, limit, offset, "OR")
+        if total:
+            notes.append(
+                "多关键词同时匹配（AND）无命中，已自动放宽为任一关键词匹配（OR），结果按相关度排序；若需精确匹配请减少关键词"
+            )
+    if total == 0 and any(len(term) >= LONG_TERM_HINT_CHARS for term in terms):
+        notes.append("关键词较长时精确匹配容易漏检：建议改用 semantic_search 以自然语言描述，或拆成更短的关键词重试")
 
     result = {
         "total_count": total,
@@ -1435,7 +1516,9 @@ def search_messages(args: dict[str, Any]) -> dict[str, Any]:
         "messages": [_to_preview_msg(row, terms) for row in rows],
     }
     if query_truncated:
-        result["note"] = f"query too long; only the first {MAX_QUERY_TERMS} terms / {MAX_QUERY_CHARS} characters were searched"
+        notes.append(f"query too long; only the first {MAX_QUERY_TERMS} terms / {MAX_QUERY_CHARS} characters were searched")
+    if notes:
+        result["note"] = "；".join(notes)
     return result
 
 
@@ -1934,7 +2017,7 @@ def fts_search_sessions(query: str, limit: int, filters: dict[str, Any] | None =
     conn = db()
     safe_limit = _safe_int(limit, 20, minimum=1, maximum=500)
     message_limit = max(200, safe_limit * 20)
-    terms, _query_truncated = _query_terms(query)
+    terms = _semantic_fts_terms(query)
     if not terms:
         return []
     use_fts = all(len(term) >= 3 for term in terms)
@@ -1942,7 +2025,7 @@ def fts_search_sessions(query: str, limit: int, filters: dict[str, Any] | None =
 
     if session_where:
         if use_fts:
-            match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+            match = _fts_match_expr(terms, "OR")
             cond = " AND ".join(["messages_fts MATCH :match", *session_where])
             rows = conn.execute(
                 f"""
@@ -1981,7 +2064,7 @@ def fts_search_sessions(query: str, limit: int, filters: dict[str, Any] | None =
         return [{"sessionId": int(row["session_id"])} for row in rows]
 
     if use_fts:
-        match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+        match = _fts_match_expr(terms, "OR")
         msg_rows = conn.execute(
             """
             SELECT m.id FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid

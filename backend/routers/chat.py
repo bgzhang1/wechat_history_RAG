@@ -166,6 +166,7 @@ def _stream_and_persist(
     history: list[BaseMessage],
     session_id: str,
     run_id: str | None = None,
+    effort: str | None = None,
 ) -> Generator[str, None, None]:
     final_answer: str | None = None
     final_thinking: str = ""
@@ -201,7 +202,7 @@ def _stream_and_persist(
             "event: session\n"
             f"data: {json.dumps({'session_id': session_id, 'status': 'running'}, ensure_ascii=False)}\n\n"
         )
-        for payload in stream_agent(question, history, session_id):
+        for payload in stream_agent(question, history, session_id, effort=effort):
             event_name, data = _parse_sse_event(payload)
             if event_name == "done" and data is not None:
                 final_answer = str(data.get("answer", ""))
@@ -286,7 +287,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
     history = _to_history(rows)
 
     return StreamingResponse(
-        _stream_and_persist(req.question, history, session_id, run_id),
+        _stream_and_persist(req.question, history, session_id, run_id, effort=req.effort),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

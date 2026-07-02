@@ -151,8 +151,12 @@
               </label>
             </div>
             <div class="form-group">
-              <label class="form-label">对话重试次数</label>
-              <input type="number" class="input" v-model.number="form.chat_max_retries" min="0" max="10" id="input-chat-max-retries" />
+              <label class="form-label">请求失败重试次数</label>
+              <input type="number" class="input" v-model.number="form.request_failure_retries" min="0" max="10" id="input-request-failure-retries" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">请求失败重试间隔 (秒)</label>
+              <input type="number" class="input" v-model.number="form.request_failure_retry_interval" min="0" max="300" step="0.5" id="input-request-failure-retry-interval" />
             </div>
             <div class="form-group">
               <label class="form-label">摘要线程数</label>
@@ -181,10 +185,6 @@
             <div class="form-group">
               <label class="form-label">Embedding 超时 (秒)</label>
               <input type="number" class="input" v-model.number="form.embed_timeout" min="1" max="1800" id="input-embed-timeout" />
-            </div>
-            <div class="form-group">
-              <label class="form-label">Embedding 重试次数</label>
-              <input type="number" class="input" v-model.number="form.embed_max_retries" min="0" max="10" id="input-embed-max-retries" />
             </div>
             <div class="form-group">
               <label class="form-label">Embedding 线程数</label>
@@ -294,13 +294,13 @@ const NUMBER_FIELDS = {
   max_history_messages: { label: '历史消息上限', min: 0, max: 200, integer: true },
   chat_timeout: { label: '超时时间', min: 1, max: 1800, integer: false },
   chat_temperature: { label: '温度', min: 0, max: 2, integer: false },
-  chat_max_retries: { label: '对话重试次数', min: 0, max: 10, integer: true },
+  request_failure_retries: { label: '请求失败重试次数', min: 0, max: 10, integer: true },
+  request_failure_retry_interval: { label: '请求失败重试间隔', min: 0, max: 300, integer: false },
   summary_workers: { label: '摘要线程数', min: 1, max: 32, integer: true },
   summary_batch_size: { label: '摘要批次大小', min: 1, max: 128, integer: true },
   summary_max_chars: { label: '摘要最大字符', min: 100, max: 20000, integer: true },
   summary_fallback_chars: { label: '摘要回退字符', min: 0, max: 20000, integer: true },
   embed_timeout: { label: 'Embedding 超时', min: 1, max: 1800, integer: false },
-  embed_max_retries: { label: 'Embedding 重试次数', min: 0, max: 10, integer: true },
   embed_workers: { label: 'Embedding 线程数', min: 1, max: 64, integer: true },
   embed_batch_size: { label: 'Embedding 批次大小', min: 1, max: 512, integer: true },
 }
@@ -314,7 +314,8 @@ const form = reactive({
   chat_base_url: '',
   chat_api_key: '',
   clear_chat_api_key: false,
-  chat_max_retries: 3,
+  request_failure_retries: 3,
+  request_failure_retry_interval: 5,
   summary_base_url: '',
   summary_api_key: '',
   summary_use_chat_base_url: true,
@@ -329,7 +330,6 @@ const form = reactive({
   embed_base_url: '',
   embed_model: '',
   embed_timeout: 90,
-  embed_max_retries: 0,
   embed_workers: 4,
   embed_batch_size: 32,
   chat_timeout: 300,
@@ -487,6 +487,8 @@ function buildSettingsPayload() {
 
 function hydrateForm(data) {
   Object.assign(form, data)
+  form.request_failure_retries = requestFailureRetriesFromSettings(data)
+  form.request_failure_retry_interval = numericSettingValue(data?.request_failure_retry_interval) ?? form.request_failure_retry_interval ?? 5
   form.enabled_tools = enabledToolsWithinAvailable(form.enabled_tools, availableTools.value)
   form.chat_api_key = ''
   form.summary_api_key = ''
@@ -496,6 +498,24 @@ function hydrateForm(data) {
   form.chat_reasoning_effort = normalizeReasoningEffort(data?.chat_reasoning_effort)
   form.summary_reasoning_effort = normalizeReasoningEffort(data?.summary_reasoning_effort)
   form.summary_use_chat_reasoning_effort = Boolean(data?.summary_reasoning_effort_inherited)
+}
+
+function requestFailureRetriesFromSettings(data) {
+  const current = numericSettingValue(data?.request_failure_retries)
+  if (current != null) return current
+
+  const legacyValues = [data?.chat_max_retries, data?.embed_max_retries]
+    .map(numericSettingValue)
+    .filter(value => value != null)
+  if (legacyValues.length > 0) return Math.max(...legacyValues)
+
+  return numericSettingValue(form.request_failure_retries) ?? 3
+}
+
+function numericSettingValue(value) {
+  if (value === '' || value == null) return null
+  const numberValue = Number(value)
+  return Number.isFinite(numberValue) ? numberValue : null
 }
 
 async function loadModelOptions(target, options = {}) {

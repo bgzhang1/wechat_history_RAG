@@ -46,6 +46,20 @@
       ></textarea>
 
       <div class="input-actions">
+        <select
+          v-model="searchEffort"
+          class="effort-select"
+          :disabled="disabled || isGenerating"
+          title="检索强度：越高检索越彻底，耗时越长"
+          aria-label="检索强度"
+          id="chat-effort"
+        >
+          <option value="">强度·默认</option>
+          <option value="low">快速</option>
+          <option value="medium">均衡</option>
+          <option value="high">深挖</option>
+          <option value="max">穷尽</option>
+        </select>
         <button
           v-if="!isGenerating"
           class="btn btn-primary btn-icon send-btn"
@@ -86,12 +100,24 @@ const inputEl = ref(null)
 const suggestions = ref([])
 const showSuggestions = ref(false)
 const selectedSuggestionIdx = ref(-1)
+const EFFORT_STORAGE_KEY = 'wechat-rag-search-effort'
+const EFFORT_VALUES = new Set(['', 'low', 'medium', 'high', 'max'])
+const searchEffort = ref(restoreSearchEffort())
 const suggestionsVisible = computed(() => showSuggestions.value && suggestions.value.length > 0)
 const activeSuggestionId = computed(() => (
   suggestionsVisible.value && selectedSuggestionIdx.value >= 0
     ? suggestionId(selectedSuggestionIdx.value)
     : undefined
 ))
+
+function restoreSearchEffort() {
+  const stored = window.localStorage.getItem(EFFORT_STORAGE_KEY) || ''
+  return EFFORT_VALUES.has(stored) ? stored : ''
+}
+
+watch(searchEffort, (value) => {
+  window.localStorage.setItem(EFFORT_STORAGE_KEY, value)
+})
 
 let suggestTimer = null
 let blurTimer = null
@@ -103,7 +129,7 @@ const MAX_SUGGESTION_QUERY_CHARS = 120
 function send() {
   const question = text.value.trim().slice(0, MAX_QUESTION_CHARS)
   if (!question || props.disabled || props.isGenerating) return
-  emit('send', question)
+  emit('send', question, searchEffort.value || null)
   text.value = ''
   closeSuggestions()
   autoResize()
@@ -335,7 +361,43 @@ onUnmounted(() => {
 .input-actions {
   flex-shrink: 0;
   display: flex;
+  align-items: center;
+  gap: var(--space-2);
   padding-bottom: 2px;
+}
+
+.effort-select {
+  height: 42px;
+  padding: 0 var(--space-6) 0 var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background-color: transparent;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 24 24' fill='none' stroke='%2364758b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right var(--space-2) center;
+  appearance: none;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.effort-select:hover:not(:disabled) {
+  background-color: var(--surface-glass-hover);
+  color: var(--text-secondary);
+}
+
+.effort-select:focus {
+  outline: none;
+  border-color: var(--border-focus);
+  color: var(--text-primary);
+}
+
+.effort-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .send-btn, .stop-btn {

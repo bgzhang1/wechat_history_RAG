@@ -305,8 +305,8 @@ function formatTime(iso) {
 }
 
 .session-checkbox input {
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   cursor: pointer;
   accent-color: var(--accent-blue);
   flex-shrink: 0;

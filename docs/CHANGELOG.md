@@ -1,5 +1,41 @@
 # 更新日志
 
+## 2026-07-02
+
+### 全项目性能/结构审查与前端 UI 现代化
+
+- 修复 `/api/ws/suggestions` WebSocket 在事件循环内直接执行 SQLite 聚合查询的问题：改为 `run_in_threadpool`，避免建议查询阻塞聊天 SSE 等全部并发请求。
+- 系统提示词"数据概况"的三组全表 GROUP BY 聚合增加 10 秒 TTL 缓存（按 DB 路径隔离），高频提问时不再重复聚合。
+- `backend/session_store.py` 不再在每次消息读写时重复执行 `PRAGMA table_info` 检查 reasoning 列，改为每连接一次。
+- Web 端打通检索努力档位：`POST /api/chat` 请求体新增可选 `effort`（low/medium/high/max，大小写不敏感、非法值 422），链路 `ChatRequest → chat 路由 → stream_agent`；前端输入区新增"检索强度"选择器（默认/快速/均衡/深挖/穷尽），选择持久化到 localStorage。
+- 聊天消息 markdown 渲染增加缓存：此前每个流式 chunk 会触发全部历史消息的 marked 重解析 + DOMPurify 重清洗（长对话明显卡顿），现在历史消息命中缓存，仅流式文本实时渲染。
+- 消息增加悬停显示的时间戳；圆角设计令牌从被压平的 6/8/8/8 恢复为 8/10/14/18 的现代柔和尺度（按钮/卡片/输入框/气泡全局生效）。
+- 会话侧栏复选框触控目标 16px → 18px；`.markdown-body` 样式移出 `@layer components` 并按气泡场景收紧标题字号——两者补齐此前未达标的前端契约测试（`test_session_sidebar_icon_actions_are_touch_friendly`、`test_chat_markdown_headings_are_sized_for_message_bubbles`）。
+- 更新两个相对实现已过时的前端契约测试锚点（SettingsPanel 的 `hydrateForm(data)`、ChatView 的 `handleSend(question, effort = null)`）；`test_settings_panel_ignores_late_async_results_after_unmount` 恢复通过。
+- 删除未被引用的静态资源 `hero.png`、`typescript.svg`、`vite.svg`。
+- 全量测试失败集合 22 → 19（修复 3、新增 0；其余为既有 WIP 待完成项：llm 重试配置迁移、ingest 进度、energy 面板等）。
+
+### Agent 检索效果优化与努力档位
+
+- 系统提示词动态注入"数据概况"：当前时间（含星期）、记录时间跨度、消息/会话/发送人规模、Top 会话与发送人列表。模型可以正确换算"昨天/上周"等相对时间（此前实测会把"上周"幻觉成 2024 年 9 月），并按真实存在的会话/发送人选择过滤条件；空库时直接引导用户先导入，不再空转检索。
+- `search_messages` 多关键词 AND 零命中时自动放宽为 OR 重查并在 `note` 中说明；LIKE 路径按命中关键词数排序。聊天消息普遍很短，多词同条命中率低，此前模型常拿到 0 结果后原地放弃。超长关键词零命中时 `note` 建议改用 `semantic_search`。
+- 语义检索的 FTS 臂新增中文长句拆词（`store._semantic_fts_terms`）：按标点分段、超过 4 字的中文段拆滑动 trigram（步长 2、末尾补齐），配合 OR + 命中数排序。此前整句作为一个 trigram 短语 MATCH 几乎必然 0 召回，向量未配置时语义检索基本失效。
+- Agent 循环拦截重复工具调用：同一提问内完全相同的 (工具, 参数) 不再重复执行，返回换策略提示，避免烧轮数；失败调用仍允许原样重试（同步与 SSE 流式共用执行层）。
+- 检索轮数耗尽时不再丢弃已检索成果：改为基于已有工具结果强制综合作答（同步与流式两条链路一致），综合失败才回退原固定文案。
+- `_looks_like_giving_up` 降误报：带具体日期/时间引用且有工具结果的回答（如"6月没找到 X，但 2024-06-15 有 Y"）不再被误判为放弃而触发无谓的重试引导。
+- 新增检索努力档位 `SEARCH_EFFORT`（low/medium/high/max）：分别对应 6/12/20/32 轮工具调用预算、1/2/3/4 次引导，以及不同强度的检索纪律提示词。低档换速度、高档换覆盖。支持环境变量初始化、`core.agent.set_search_effort()` 运行时切换、`run_agent(..., effort=...)` / `stream_agent(..., effort=...)` 单次调用覆盖，以及 CLI 内 `/effort` 命令。
+- 工具描述与提示词路由细化：声明 AND 语义、关键词宜少而精、长句禁入 `search_messages`、相对时间先按数据概况换算、`message_ids_sample` 可直接作为 `get_context` 入口。
+- 新增 `bench/search_eval/` 搜索效果 A/B 评测（合成中文数据集 + 8 个检索层用例 + 10 个端到端用例，`baseline_pkg/` 为改动前快照）。实测：检索层命中 6/8 → 8/8；端到端（真实 LLM）平均得分 0.95 → 1.00，总耗时 134.9s → 77.8s（-42%），LLM 调用 27 → 24 次。
+- 新增 `tests/test_agent_loop_optimizations.py`（27 用例）覆盖以上全部行为；既有相关测试模块全部通过。
+
+## 2026-06-22
+
+### 技术文档同步
+
+- 重写 `docs/TECHNICAL.md`，按当前源码重新梳理系统边界、模块职责、运行配置、SQLite 数据模型、WeFlow 解析、导入模式、Agent/SSE 契约、前端架构、日志脱敏和运维注意事项。
+- 更新 `backend/API_DOCS.md`，补充 SSE `thinking` 事件、`done.thinking` 字段、`/api/settings/models` 模型列表接口，以及设置页可覆盖字段、继承规则和 API Key 不回显但可本地持久化的真实行为。
+- 更新 `.env.example`，补充 `CHAT_REASONING_EFFORT`、`SUMMARY_BASE_URL`、`SUMMARY_API_KEY`、`SUMMARY_REASONING_EFFORT`、`REQUEST_FAILURE_RETRIES` 和 `REQUEST_FAILURE_RETRY_INTERVAL` 示例。
+
 ## 2026-06-19
 
 ### 文件级导入范围与旧库兼容
@@ -140,7 +176,7 @@
 - 日志系统输出 JSONL 诊断日志，支持近期日志 API、日志级别校验、损坏行跳过、用户可见消息翻译和敏感信息脱敏。
 - 健康诊断细分数据库、聊天模型、embedding 配置、向量索引和会话分块状态，能区分空库、有消息但无分块、缺向量、缺 embedding 配置等场景。
 - 健康接口补充摘要模型配置和向量索引可用性字段，前端可据此隐藏当前环境无法执行的摘要或向量构建模式。
-- 设置 API 支持持久化非密钥运行时配置到 `runtime/backend_settings.json`，API Key 仍只从环境变量读取。
+- 设置 API 初版支持持久化非密钥运行时配置到 `runtime/backend_settings.json`，API Key 仍只从环境变量读取；当前版本已支持设置页保存对话/摘要 API Key 的本地运行时覆盖，且不会在响应中回显。
 - 保存与环境变量相同的模型/超时不会冻结为旧 override；`chat_model: null` 和 `chat_timeout: null` 表示清除运行时 override 并回到环境变量。
 - 设置保存增加原子写入、失败回滚、非法工具拒绝、空 system prompt 拒绝、数值范围校验和重置失败保护。
 - 设置响应新增只读 `available_tools`，前端根据后端注册表渲染工具开关。

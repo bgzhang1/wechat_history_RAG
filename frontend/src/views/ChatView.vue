@@ -313,7 +313,7 @@ function newChat() {
   toolEvents.value = []
 }
 
-async function handleSend(question) {
+async function handleSend(question, effort = null) {
   const questionText = question.trim()
   if (isGenerating.value || loadingMessages.value || chatInputBlocked.value || !questionText) return
 
@@ -387,7 +387,7 @@ async function handleSend(question) {
       clearStreamState()
       loadSessions({ force: true })
     },
-  })
+  }, { effort })
 }
 
 async function handleStop() {
